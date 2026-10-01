@@ -1,0 +1,2 @@
+# Copy to .dev.vars for `wrangler dev`. Never commit the real file.
+FORGE_WRITE_TOKEN=replace-with-a-long-random-string
