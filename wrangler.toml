@@ -1,6 +1,8 @@
 name = "ramen-forge"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
+# Top-level keys must come before any [table] header, or TOML nests them inside it.
+account_id = "bfbf0f57606c0dfd9fb36bef616d9158"
 
 [observability]
 enabled = true
@@ -8,8 +10,7 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "ramen-forge-db"
-# Replace with the id printed by `npx wrangler d1 create ramen-forge-db`.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "c0cc03e9-69ee-4e03-9798-27747103658f"
 migrations_dir = "migrations"
 
 # Write endpoints (POST /api/v1/exemplars, POST /api/v1/seed) require a bearer token.
