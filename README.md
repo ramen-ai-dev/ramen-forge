@@ -45,9 +45,23 @@ Records use the same field names as foundry's `CorrectionExemplar.to_dict()`, pl
 
 Ingests one exemplar. Returns `201 { "success": true, "exemplar_id": "<uuid>" }`.
 
-Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset), `receipt_id` (the ramen-ai receipt id from the evaluation that produced the lesson). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `task_fingerprint`.
+Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset), `receipt` (the full Schema V5 receipt object from the ramen-ai evaluation of the repaired call). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `receipt_id` (must equal `receipt.id`), `task_fingerprint`.
 
-A missing, `null`, or empty `receipt_id` is rejected with `422` and `"Every exemplar must carry a verified ramen ai receipt_id."` The forge checks that the id is present and well-formed; it does not fetch or cryptographically verify the receipt.
+The receipt is checked before anything else, in `src/receipt.ts`:
+
+1. `schema_version` is `"5.0"` and `kid` is `"ramen_pk_v1"`.
+2. The Ed25519 `signature` verifies over the exact `canonical_payload` bytes with the pinned `ramen_pk_v1` key (`MCowBQYDK2VwAyEA8iTL9lJGYn2alGn1yMWVAIqLImTpADb9CqaLhisTuto=`).
+3. The **signed** payload has `schema_version` `"5.0"`, `kid` `"ramen_pk_v1"`, the same `id`, and `verdict: 1` (ALLOW). An unsigned top-level `verdict`, if sent, must agree with the signed one.
+
+Any failure, including a missing receipt or a bare `receipt_id` string, returns `422`:
+
+```json
+{ "success": false, "error": { "code": "INVALID_CRYPTOGRAPHIC_RECEIPT", "message": "Exemplar rejected: Every record must carry an authentic, verified Schema V5 receipt with verdict=1." }, "details": ["<reason>"] }
+```
+
+`receipt.id` is stored in the `receipt_id` column. The check proves the receipt is a genuine ALLOW verdict; it does not bind the receipt to the exemplar's content, because `payload_hash` covers the evaluated input string, which is not part of the exemplar.
+
+The `exemplars` table is append-only: migration `0003` adds a `BEFORE DELETE` trigger that fails every `DELETE`.
 
 Payloads are rejected with `422` and a list of reasons when they:
 

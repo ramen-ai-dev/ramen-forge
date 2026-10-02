@@ -16,12 +16,12 @@ import {
   secondsUntilNextHour,
 } from "./calibrate";
 import { renderConsole } from "./console";
+import { INVALID_RECEIPT_CODE, INVALID_RECEIPT_MESSAGE, verifyExemplarReceipt } from "./receipt";
 import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
 import {
   MAX_BODY_BYTES,
   MAX_CALIBRATE_BODY_BYTES,
   QUERY_PATTERNS,
-  RECEIPT_REQUIRED_MESSAGE,
   checkSearchTerm,
   parseStoredObject,
   toLikePattern,
@@ -152,10 +152,21 @@ app.post("/api/v1/exemplars", async (c) => {
   const parsed = await readJsonBody(c);
   if (!parsed.ok) return parsed.response;
 
-  const result = await validateExemplar(parsed.body);
+  // Receipt first: nothing is validated or stored without an authentic ALLOW receipt.
+  const body = parsed.body;
+  const receipt = await verifyExemplarReceipt(
+    typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>).receipt : undefined,
+  );
+  if (!receipt.ok) {
+    return c.json(
+      { success: false, error: { code: INVALID_RECEIPT_CODE, message: INVALID_RECEIPT_MESSAGE }, details: [receipt.reason] },
+      422,
+    );
+  }
+
+  const result = await validateExemplar(body, receipt.receiptId);
   if (!result.ok) {
-    const error = result.errors.includes(RECEIPT_REQUIRED_MESSAGE) ? RECEIPT_REQUIRED_MESSAGE : "exemplar rejected";
-    return c.json({ success: false, error, details: result.errors }, 422);
+    return c.json({ success: false, error: "exemplar rejected", details: result.errors }, 422);
   }
 
   try {

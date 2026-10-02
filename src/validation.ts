@@ -19,8 +19,6 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 const DOMAIN_RE = /^[a-z0-9][a-z0-9_-]{1,63}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
-const RECEIPT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-export const RECEIPT_REQUIRED_MESSAGE = "Every exemplar must carry a verified ramen ai receipt_id.";
 // ISO 8601 date-time with mandatory UTC offset, matching foundry's tz-aware requirement.
 const ISO_WITH_OFFSET_RE =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
@@ -57,6 +55,7 @@ const ALLOWED_KEYS = new Set<string>([
   "steering_directive",
   "repaired_arguments",
   "receipt_id",
+  "receipt",
   "created_at",
 ]);
 
@@ -146,8 +145,14 @@ function checkArguments(value: unknown, name: string, errors: string[], strings:
  * Validate an untrusted payload against the CorrectionExemplar invariants.
  * `task_fingerprint` is optional on input; when present it must equal
  * SHA-256(task_description), the same digest foundry's `fingerprint_task` uses.
+ * `verifiedReceiptId` is the id of a receipt already verified by
+ * `verifyExemplarReceipt`; it is what gets stored as receipt_id.
  */
-export async function validateExemplar(payload: unknown, now: Date = new Date()): Promise<ValidationResult> {
+export async function validateExemplar(
+  payload: unknown,
+  verifiedReceiptId: string,
+  now: Date = new Date(),
+): Promise<ValidationResult> {
   const errors: string[] = [];
   if (!isPlainObject(payload)) {
     return { ok: false, errors: ["payload must be a JSON object"] };
@@ -201,13 +206,16 @@ export async function validateExemplar(payload: unknown, now: Date = new Date())
       : checkArguments(payload.failed_arguments, "failed_arguments", errors, strings);
   const repairedArguments = checkArguments(payload.repaired_arguments, "repaired_arguments", errors, strings);
 
-  // Every exemplar must come from a live ramen-ai evaluation. This checks the
-  // receipt_id is present and well-formed; it does not verify the receipt itself.
-  const receiptId = payload.receipt_id;
-  if (receiptId === undefined || receiptId === null || (typeof receiptId === "string" && receiptId.trim() === "")) {
-    errors.push(RECEIPT_REQUIRED_MESSAGE);
-  } else if (typeof receiptId !== "string" || !RECEIPT_ID_RE.test(receiptId)) {
-    errors.push("receipt_id must be 1-128 characters of [A-Za-z0-9_.:-]");
+  // The receipt itself is verified by the caller (src/receipt.ts) before this
+  // runs. A top-level receipt_id, as sent by foundry's to_dict(), is optional
+  // but must name the same receipt.
+  const suppliedReceiptId = payload.receipt_id;
+  if (
+    suppliedReceiptId !== undefined &&
+    suppliedReceiptId !== null &&
+    (typeof suppliedReceiptId !== "string" || suppliedReceiptId.toLowerCase() !== verifiedReceiptId)
+  ) {
+    errors.push("receipt_id does not match receipt.id");
   }
 
   const createdAt = payload.created_at;
@@ -255,7 +263,7 @@ export async function validateExemplar(payload: unknown, now: Date = new Date())
       primary_statutory_anchor: text.primary_statutory_anchor as string,
       steering_directive: text.steering_directive as string,
       repaired_arguments: repairedArguments,
-      receipt_id: receiptId as string,
+      receipt_id: verifiedReceiptId,
       created_at: createdAt as string,
     },
   };
