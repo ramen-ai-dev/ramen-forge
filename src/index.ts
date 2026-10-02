@@ -6,7 +6,15 @@
  * back so agents can avoid known failure modes on their first attempt.
  */
 import { Hono, type Context } from "hono";
-import { DOMAIN_BUNDLES, consumeRateLimit, evaluateCalibration } from "./calibrate";
+import {
+  DOMAIN_BUNDLES,
+  GLOBAL_CALIBRATE_LIMIT_PER_HOUR,
+  consumeRateLimit,
+  evaluateCalibration,
+  globalCapacityReached,
+  reserveGlobalSlot,
+  secondsUntilNextHour,
+} from "./calibrate";
 import { renderConsole } from "./console";
 import { SEED_BANK } from "./seed";
 import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
@@ -272,11 +280,30 @@ app.post("/api/v1/seed", async (c) => {
   });
 });
 
+function communityCapacityReached(c: AppContext): Response {
+  c.header("Retry-After", String(secondsUntilNextHour()));
+  return c.json(
+    {
+      success: false,
+      error: {
+        code: "COMMUNITY_CAPACITY_REACHED",
+        message:
+          `Global community calibration capacity reached for this hour (${GLOBAL_CALIBRATE_LIMIT_PER_HOUR}/${GLOBAL_CALIBRATE_LIMIT_PER_HOUR}). ` +
+          "Please retry at the top of the hour or deploy ramen foundry with your own API key.",
+      },
+    },
+    503,
+  );
+}
+
 app.post("/api/v1/calibrate", async (c) => {
   const apiKey = c.env.RAMEN_API_KEY;
   if (!apiKey) {
     return c.json({ success: false, error: "calibration disabled: RAMEN_API_KEY is not configured" }, 503);
   }
+
+  // Global ceiling first: fail fast without charging the caller's per-IP quota.
+  if (await globalCapacityReached(c.env.DB)) return communityCapacityReached(c);
 
   // Count every attempt, valid or not, so malformed floods are throttled too.
   const ip = c.req.header("cf-connecting-ip") ?? "unknown";
@@ -307,6 +334,9 @@ app.post("/api/v1/calibrate", async (c) => {
       422,
     );
   }
+
+  // Atomic reservation closes the race between the pre-check and the upstream call.
+  if (!(await reserveGlobalSlot(c.env.DB))) return communityCapacityReached(c);
 
   const outcome = await evaluateCalibration(apiKey, request.value, bundleId);
   if (!outcome.ok) {

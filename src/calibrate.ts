@@ -17,6 +17,54 @@ export const DOMAIN_BUNDLES: Readonly<Record<string, string>> = {
   devsecops: "ramen__shield_core_it",
 };
 
+/** Ceiling on upstream ramen-ai evaluations per UTC hour, across all clients combined. */
+export const GLOBAL_CALIBRATE_LIMIT_PER_HOUR = 500;
+/** Sentinel client_key for the global counter. Per-IP keys are 64-char hex, so it cannot collide. */
+const GLOBAL_CLIENT_KEY = "__global__";
+
+/** Current UTC hour bucket (unix ms / 3,600,000), the same window used by the per-IP limit. */
+export function currentWindow(now = Date.now()): number {
+  return Math.floor(now / HOUR_MS);
+}
+
+/** Whole seconds until the top of the next UTC hour (at least 1). */
+export function secondsUntilNextHour(now = Date.now()): number {
+  return Math.max(1, Math.ceil(((currentWindow(now) + 1) * HOUR_MS - now) / 1000));
+}
+
+/**
+ * Read-only check of global usage for this hour. Runs before the per-IP limit
+ * so a saturated proxy fails fast without charging the caller's own quota.
+ */
+export async function globalCapacityReached(db: D1Database, now = Date.now()): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT COALESCE(SUM(request_count), 0) AS global_count FROM rate_limits WHERE client_key = ?1 AND window_start = ?2")
+    .bind(GLOBAL_CLIENT_KEY, currentWindow(now))
+    .first<{ global_count: number }>();
+  return Number(row?.global_count ?? 0) >= GLOBAL_CALIBRATE_LIMIT_PER_HOUR;
+}
+
+/**
+ * Atomically reserve one upstream evaluation slot. The conditional upsert only
+ * increments while the count is below the ceiling, so concurrent requests
+ * cannot overshoot it. Returns false when no slot is left.
+ *
+ * Only requests that are about to call ramen-ai reserve a slot. Rejected
+ * bodies and per-IP 429s never touch this counter, so a single noisy client
+ * cannot exhaust community capacity without spending real quota.
+ */
+export async function reserveGlobalSlot(db: D1Database, now = Date.now()): Promise<boolean> {
+  const row = await db
+    .prepare(
+      "INSERT INTO rate_limits (client_key, window_start, request_count) VALUES (?1, ?2, 1) " +
+        "ON CONFLICT (client_key, window_start) DO UPDATE SET request_count = request_count + 1 " +
+        "WHERE request_count < ?3 RETURNING request_count",
+    )
+    .bind(GLOBAL_CLIENT_KEY, currentWindow(now), GLOBAL_CALIBRATE_LIMIT_PER_HOUR)
+    .first<{ request_count: number }>();
+  return row !== null;
+}
+
 export interface RateLimitDecision {
   allowed: boolean;
   limit: number;

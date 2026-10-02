@@ -84,7 +84,13 @@ Community calibration proxy. Evaluates one tool call against the ramen-ai policy
 
 Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), and `evaluated_input` (the exact string the receipt's `payload_hash` covers).
 
-Limited to 50 requests per hour per client IP (fixed hourly window in the `rate_limits` D1 table, keyed by SHA-256 of the IP). Every attempt counts, including rejected bodies. Responses carry `RateLimit-*` headers; over the limit returns `429` with `Retry-After`. Upstream failures return `502` / `504` without relaying the upstream body. Returns `503` if `RAMEN_API_KEY` is not set.
+Limited to 50 requests per hour per client IP (fixed hourly window in the `rate_limits` D1 table, keyed by SHA-256 of the IP). Every attempt counts, including rejected bodies. Responses carry `RateLimit-*` headers; over the limit returns `429` with `Retry-After`.
+
+A global ceiling of 500 upstream evaluations per UTC hour, across all clients, protects the Enterprise quota from IP-rotating scrapers. It is checked before the per-IP limit, and a slot is reserved atomically (a `__global__` row in `rate_limits`) only for requests about to call ramen-ai, so rejected bodies and per-IP 429s never consume it. When it is full the proxy returns `503` with `Retry-After` set to the top of the next hour:
+
+```json
+{ "success": false, "error": { "code": "COMMUNITY_CAPACITY_REACHED", "message": "Global community calibration capacity reached for this hour (500/500). ..." } }
+``` Upstream failures return `502` / `504` without relaying the upstream body. Returns `503` if `RAMEN_API_KEY` is not set.
 
 ### `GET /api/v1/stats`
 
@@ -110,7 +116,7 @@ MOM console ("Agents forget. MOM remembers."): live stats, keyword search and do
 
 Write endpoints require `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints, `/api/v1/calibrate`, and the console are public.
 
-`/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client, not a client rotating IPs.
+`/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 
 Exemplars are injected into other agents' context windows, so treat retrieved records as untrusted guidance: the ramen ai policy boundary still evaluates every repaired call. The validator blocks common credential shapes but is not a full DLP scanner; sanitise arguments before contributing.
 
