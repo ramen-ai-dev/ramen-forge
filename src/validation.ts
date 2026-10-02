@@ -20,6 +20,7 @@ const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 const DOMAIN_RE = /^[a-z0-9][a-z0-9_-]{1,63}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
 const RECEIPT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+export const RECEIPT_REQUIRED_MESSAGE = "Every exemplar must carry a verified ramen ai receipt_id.";
 // ISO 8601 date-time with mandatory UTC offset, matching foundry's tz-aware requirement.
 const ISO_WITH_OFFSET_RE =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
@@ -200,9 +201,13 @@ export async function validateExemplar(payload: unknown, now: Date = new Date())
       : checkArguments(payload.failed_arguments, "failed_arguments", errors, strings);
   const repairedArguments = checkArguments(payload.repaired_arguments, "repaired_arguments", errors, strings);
 
-  const receiptId = payload.receipt_id ?? null;
-  if (receiptId !== null && (typeof receiptId !== "string" || !RECEIPT_ID_RE.test(receiptId))) {
-    errors.push("receipt_id must be null or 1-128 characters of [A-Za-z0-9_.:-]");
+  // Every exemplar must come from a live ramen-ai evaluation. This checks the
+  // receipt_id is present and well-formed; it does not verify the receipt itself.
+  const receiptId = payload.receipt_id;
+  if (receiptId === undefined || receiptId === null || (typeof receiptId === "string" && receiptId.trim() === "")) {
+    errors.push(RECEIPT_REQUIRED_MESSAGE);
+  } else if (typeof receiptId !== "string" || !RECEIPT_ID_RE.test(receiptId)) {
+    errors.push("receipt_id must be 1-128 characters of [A-Za-z0-9_.:-]");
   }
 
   const createdAt = payload.created_at;
@@ -250,7 +255,7 @@ export async function validateExemplar(payload: unknown, now: Date = new Date())
       primary_statutory_anchor: text.primary_statutory_anchor as string,
       steering_directive: text.steering_directive as string,
       repaired_arguments: repairedArguments,
-      receipt_id: receiptId as string | null,
+      receipt_id: receiptId as string,
       created_at: createdAt as string,
     },
   };

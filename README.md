@@ -45,7 +45,9 @@ Records use the same field names as foundry's `CorrectionExemplar.to_dict()`, pl
 
 Ingests one exemplar. Returns `201 { "success": true, "exemplar_id": "<uuid>" }`.
 
-Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `receipt_id`, `task_fingerprint`.
+Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset), `receipt_id` (the ramen-ai receipt id from the evaluation that produced the lesson). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `task_fingerprint`.
+
+A missing, `null`, or empty `receipt_id` is rejected with `422` and `"Every exemplar must carry a verified ramen ai receipt_id."` The forge checks that the id is present and well-formed; it does not fetch or cryptographically verify the receipt.
 
 Payloads are rejected with `422` and a list of reasons when they:
 
@@ -96,25 +98,13 @@ A global ceiling of 500 upstream evaluations per UTC hour, across all clients, p
 
 Totals for the console: `total_community_exemplars`, `active_domains`, `statutory_anchors_count` (distinct `primary_statutory_anchor` values across community exemplars), and per-domain counts. `recovery_rate` and `receipt_verified_exemplars` were removed.
 
-### `POST /api/v1/seed` (auth required)
-
-Idempotently loads the curated seed bank (fixed IDs, `INSERT OR IGNORE`). Returns `inserted` / `skipped` counts.
-
-| Domain | Tool | Repair |
-| --- | --- | --- |
-| fintech | `issue_adverse_action_notice` | ECOA Reg B: postal-code proxy reason replaced with `INSUFFICIENT_LIQUIDITY` |
-| fintech | `initiate_wire_transfer` | UCC 4A: officer co-signer attached for wires ≥ USD 10,000 |
-| industrial_iot | `set_robot_tcp_speed` | ISO/TS 15066: TCP speed de-rated 0.85 → 0.25 m/s near humans |
-| industrial_iot | `place_material` | NFPA 86: volatile canister placement near burner halted and rerouted |
-| devsecops | `run_bash` | OWASP LLM06: root wipe replaced with scoped directory target |
-
 ### `GET /`
 
 MOM console ("Agents forget. MOM remembers."): live stats, keyword search and domain filter chips over the memory bank, and a copyable quickstart.
 
 ## Authentication and trust
 
-Write endpoints require `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints, `/api/v1/calibrate`, and the console are public.
+`POST /api/v1/exemplars` requires `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints, `/api/v1/calibrate`, and the console are public.
 
 `/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 
@@ -137,8 +127,9 @@ npx wrangler d1 migrations apply DB --local
 cp .dev.vars.example .dev.vars   # then edit FORGE_WRITE_TOKEN
 
 npm run dev
-curl -X POST -H "Authorization: Bearer $FORGE_WRITE_TOKEN" http://localhost:8787/api/v1/seed
 ```
+
+There is no seed data. The forge only holds exemplars contributed from live ramen-ai evaluations.
 
 Deploy:
 

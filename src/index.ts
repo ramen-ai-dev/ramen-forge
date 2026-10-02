@@ -16,12 +16,12 @@ import {
   secondsUntilNextHour,
 } from "./calibrate";
 import { renderConsole } from "./console";
-import { SEED_BANK } from "./seed";
 import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
 import {
   MAX_BODY_BYTES,
   MAX_CALIBRATE_BODY_BYTES,
   QUERY_PATTERNS,
+  RECEIPT_REQUIRED_MESSAGE,
   checkSearchTerm,
   parseStoredObject,
   toLikePattern,
@@ -154,7 +154,8 @@ app.post("/api/v1/exemplars", async (c) => {
 
   const result = await validateExemplar(parsed.body);
   if (!result.ok) {
-    return c.json({ success: false, error: "exemplar rejected", details: result.errors }, 422);
+    const error = result.errors.includes(RECEIPT_REQUIRED_MESSAGE) ? RECEIPT_REQUIRED_MESSAGE : "exemplar rejected";
+    return c.json({ success: false, error, details: result.errors }, 422);
   }
 
   try {
@@ -247,33 +248,6 @@ app.get("/api/v1/stats", async (c) => {
     active_domains: Number(row.domains ?? 0),
     statutory_anchors_count: Number(row.anchor_count ?? 0),
     domains: (domains?.results ?? []).map((d) => ({ domain: String(d.domain), exemplars: Number(d.exemplars) })),
-  });
-});
-
-app.post("/api/v1/seed", async (c) => {
-  const denied = await authoriseWrite(c);
-  if (denied) return denied;
-
-  // Seeds go through the same validator as community contributions.
-  const validated: CorrectionExemplarInput[] = [];
-  for (const seed of SEED_BANK) {
-    const result = await validateExemplar(seed);
-    if (!result.ok) {
-      throw new Error(`seed ${seed.exemplar_id} failed validation: ${result.errors.join("; ")}`);
-    }
-    validated.push(result.value);
-  }
-
-  const insertOrIgnore = INSERT_SQL.replace(/^INSERT INTO/, "INSERT OR IGNORE INTO");
-  const results = await c.env.DB.batch(validated.map((exemplar) => bindExemplar(c.env.DB, insertOrIgnore, exemplar)));
-  const inserted = results.reduce((sum, r) => sum + (r.meta.changes ?? 0), 0);
-
-  return c.json({
-    success: true,
-    inserted,
-    skipped: validated.length - inserted,
-    seed_bank_size: validated.length,
-    exemplar_ids: validated.map((e) => e.exemplar_id),
   });
 });
 
