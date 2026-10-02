@@ -45,7 +45,7 @@ Records use the same field names as foundry's `CorrectionExemplar.to_dict()`, pl
 
 Ingests one exemplar. Returns `201 { "success": true, "exemplar_id": "<uuid>" }`.
 
-Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `failed_arguments` (object), `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset). Optional: `receipt_id`, `task_fingerprint`.
+Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `receipt_id`, `task_fingerprint`.
 
 Payloads are rejected with `422` and a list of reasons when they:
 
@@ -94,7 +94,7 @@ A global ceiling of 500 upstream evaluations per UTC hour, across all clients, p
 
 ### `GET /api/v1/stats`
 
-Totals for the console: exemplar count, active domains, per-domain counts, and `recovery_rate` (share of exemplars anchored to a ramen-ai `receipt_id`). Seed exemplars have no receipt, so a freshly seeded forge reports 0%.
+Totals for the console: `total_community_exemplars`, `active_domains`, `statutory_anchors_count` (distinct `primary_statutory_anchor` values across community exemplars), and per-domain counts. `recovery_rate` and `receipt_verified_exemplars` were removed.
 
 ### `POST /api/v1/seed` (auth required)
 

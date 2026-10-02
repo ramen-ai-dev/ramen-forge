@@ -64,7 +64,6 @@ const REQUIRED_KEYS = [
   "domain",
   "task_description",
   "tool_name",
-  "failed_arguments",
   "violation_reason",
   "primary_statutory_anchor",
   "steering_directive",
@@ -193,7 +192,12 @@ export async function validateExemplar(payload: unknown, now: Date = new Date())
     }
   }
 
-  const failedArguments = checkArguments(payload.failed_arguments, "failed_arguments", errors, strings);
+  // Optional: lessons can be contributed without the original failing call.
+  // Omitted (or null) is stored as {} so records still rehydrate as foundry CorrectionExemplars.
+  const failedArguments =
+    payload.failed_arguments === undefined || payload.failed_arguments === null
+      ? {}
+      : checkArguments(payload.failed_arguments, "failed_arguments", errors, strings);
   const repairedArguments = checkArguments(payload.repaired_arguments, "repaired_arguments", errors, strings);
 
   const receiptId = payload.receipt_id ?? null;

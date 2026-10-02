@@ -45,16 +45,16 @@ export function renderConsole(nonce: string): string {
         <p id="stat-domain-list" class="mt-1 text-xs text-zinc-400"></p>
       </div>
       <div class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
-        <p class="text-xs uppercase tracking-wider text-zinc-400">Community Recovery Rate</p>
-        <p id="stat-recovery" class="mt-2 text-3xl font-semibold">–</p>
-        <p class="mt-1 text-xs text-zinc-400">Share of exemplars anchored to a ramen-ai receipt.</p>
+        <p class="text-xs uppercase tracking-wider text-zinc-400">Statutory &amp; Regulatory Anchors</p>
+        <p id="stat-anchors" class="mt-2 text-3xl font-semibold">–</p>
+        <p class="mt-1 text-xs text-zinc-400">Active codified legal and physical rules preventing first-turn agent failures.</p>
       </div>
     </div>
   </section>
 
   <section aria-labelledby="stream-heading">
     <div class="flex flex-wrap items-baseline justify-between gap-2">
-      <h2 id="stream-heading" class="text-lg font-semibold">Domain Memory</h2>
+      <h2 id="stream-heading" class="text-lg font-semibold">Domain Memory Lessons</h2>
       <p id="status" class="text-xs text-zinc-500" role="status"></p>
     </div>
 
@@ -73,13 +73,13 @@ export function renderConsole(nonce: string): string {
 
     <div class="mt-3 overflow-x-auto rounded-lg border border-zinc-800">
       <table class="min-w-full text-sm">
-        <caption class="sr-only">Exemplars matching the current search and domain filter, newest first</caption>
+        <caption class="sr-only">Domain memory lessons matching the current search and domain filter, newest first</caption>
         <thead class="bg-zinc-900 text-left text-xs uppercase tracking-wider text-zinc-400">
           <tr>
             <th scope="col" class="px-4 py-3">Domain</th>
             <th scope="col" class="px-4 py-3">Tool</th>
             <th scope="col" class="px-4 py-3">Statutory Rule</th>
-            <th scope="col" class="px-4 py-3">Steering Directive</th>
+            <th scope="col" class="px-4 py-3">Directive &amp; Lesson</th>
           </tr>
         </thead>
         <tbody id="stream" class="divide-y divide-zinc-800">
@@ -147,7 +147,7 @@ export function renderConsole(nonce: string): string {
       $("stat-total").textContent = String(stats.total_community_exemplars);
       $("stat-domains").textContent = String(stats.active_domains);
       $("stat-domain-list").textContent = stats.domains.map((d) => d.domain + " (" + d.exemplars + ")").join(" · ");
-      $("stat-recovery").textContent = (stats.recovery_rate * 100).toFixed(1) + "%";
+      $("stat-anchors").textContent = String(stats.statutory_anchors_count);
     } catch (err) {
       $("status").textContent = "Stats unavailable: " + err.message;
     }

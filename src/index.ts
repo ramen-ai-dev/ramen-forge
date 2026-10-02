@@ -233,22 +233,19 @@ app.get("/api/v1/exemplars", async (c) => {
 app.get("/api/v1/stats", async (c) => {
   const [totals, domains] = await c.env.DB.batch<Record<string, unknown>>([
     c.env.DB.prepare(
-      "SELECT COUNT(*) AS total, COUNT(receipt_id) AS receipted, COUNT(DISTINCT domain) AS domains " +
-        "FROM exemplars WHERE tier = ?",
+      "SELECT COUNT(*) AS total, COUNT(DISTINCT domain) AS domains, " +
+        "COUNT(DISTINCT primary_statutory_anchor) AS anchor_count FROM exemplars WHERE tier = ?",
     ).bind(COMMUNITY_TIER),
     c.env.DB.prepare(
       "SELECT domain, COUNT(*) AS exemplars FROM exemplars WHERE tier = ? GROUP BY domain ORDER BY exemplars DESC, domain",
     ).bind(COMMUNITY_TIER),
   ]);
   const row = totals?.results[0] ?? {};
-  const total = Number(row.total ?? 0);
-  const receipted = Number(row.receipted ?? 0);
   return c.json({
     success: true,
-    total_community_exemplars: total,
+    total_community_exemplars: Number(row.total ?? 0),
     active_domains: Number(row.domains ?? 0),
-    receipt_verified_exemplars: receipted,
-    recovery_rate: total === 0 ? 0 : receipted / total,
+    statutory_anchors_count: Number(row.anchor_count ?? 0),
     domains: (domains?.results ?? []).map((d) => ({ domain: String(d.domain), exemplars: Number(d.exemplars) })),
   });
 });
