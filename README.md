@@ -25,7 +25,7 @@ ramen-forge is the **Level 1 Community Memory Commons**. It ingests normalised `
 1. A foundry agent's tool call is blocked by the ramen ai policy boundary.
 2. The agent repairs the call using the steering directive, and the repaired call is allowed.
 3. Foundry records a `CorrectionExemplar` locally (Level 0) and can contribute it to ramen-forge (Level 1).
-4. Before Turn 1 on a later task, any agent queries ramen-forge by `tool_name` / `task_fingerprint` / `domain` and starts with the repair already in context.
+4. Before Turn 1 on a later task, any agent queries ramen-forge by `domain` / `tool_name` / keyword (`q`) / `task_fingerprint` and starts with the repair already in context.
 
 ramen ai stays stateless. Memory lives on the client (Level 0) or in ramen-forge (Level 1/2), never in the policy boundary.
 
@@ -58,7 +58,33 @@ Duplicate `exemplar_id` returns `409`. Everything ingested is stored as `tier = 
 
 ### `GET /api/v1/exemplars`
 
-Query parameters, all optional and combined with AND: `domain`, `tool_name`, `task_fingerprint`, `limit` (1–50, default 10). Returns `{ "success": true, "count": n, "exemplars": [...] }`, newest first.
+Query parameters, all optional and combined with AND: `domain`, `tool_name`, `task_fingerprint`, `q`, `limit` (1–50, default 10). Returns `{ "success": true, "count": n, "exemplars": [...] }`, newest first.
+
+- `task_fingerprint` matches one exact task phrasing.
+- `q` (≤ 100 characters) is a case-insensitive keyword match across `task_description`, `violation_reason`, and `steering_directive`, so lessons are shared across different phrasings of the same task. `%` and `_` are matched literally.
+
+```bash
+curl "https://ramen-forge.ramenai.workers.dev/api/v1/exemplars?domain=fintech&tool_name=initiate_wire_transfer"
+curl "https://ramen-forge.ramenai.workers.dev/api/v1/exemplars?q=burner"
+```
+
+### `POST /api/v1/calibrate`
+
+Community calibration proxy. Evaluates one tool call against the ramen-ai policy bundle for its domain, using the forge's `RAMEN_API_KEY`, so agents can test a call without their own key.
+
+```json
+{ "domain": "devsecops", "tool": "run_bash", "arguments": { "command": "rm -rf /" } }
+```
+
+| Domain | Bundle |
+| --- | --- |
+| `fintech` | `ramen__fintech_banking_invariance` |
+| `industrial_iot`, `robotics` | `ramen__industrial_iot_actuation_invariance` |
+| `devsecops` | `ramen__shield_core_it` |
+
+Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), and `evaluated_input` (the exact string the receipt's `payload_hash` covers).
+
+Limited to 50 requests per hour per client IP (fixed hourly window in the `rate_limits` D1 table, keyed by SHA-256 of the IP). Every attempt counts, including rejected bodies. Responses carry `RateLimit-*` headers; over the limit returns `429` with `Retry-After`. Upstream failures return `502` / `504` without relaying the upstream body. Returns `503` if `RAMEN_API_KEY` is not set.
 
 ### `GET /api/v1/stats`
 
@@ -78,11 +104,13 @@ Idempotently loads the curated seed bank (fixed IDs, `INSERT OR IGNORE`). Return
 
 ### `GET /`
 
-Monitoring console: live stats, a stream of recent lessons, and a copyable quickstart.
+MOM console ("Agents forget. MOM remembers."): live stats, keyword search and domain filter chips over the memory bank, and a copyable quickstart.
 
 ## Authentication and trust
 
-Write endpoints require `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints and the console are public.
+Write endpoints require `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints, `/api/v1/calibrate`, and the console are public.
+
+`/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client, not a client rotating IPs.
 
 Exemplars are injected into other agents' context windows, so treat retrieved records as untrusted guidance: the ramen ai policy boundary still evaluates every repaired call. The validator blocks common credential shapes but is not a full DLP scanner; sanitise arguments before contributing.
 
@@ -111,21 +139,19 @@ Deploy:
 ```bash
 npx wrangler d1 migrations apply DB --remote
 npx wrangler secret put FORGE_WRITE_TOKEN
+npx wrangler secret put RAMEN_API_KEY
 npm run deploy
 ```
+
+For local calibrate testing, add `RAMEN_API_KEY` to `.dev.vars`.
 
 Typecheck with `npx tsc --noEmit`.
 
 ## Quickstart from a ramen-foundry agent
 
 ```python
-import httpx; from ramen_foundry import CorrectionExemplar
-lessons = [CorrectionExemplar.from_dict(e) for e in httpx.get("https://<your-forge>/api/v1/exemplars", params={"tool_name": tool_name, "task_fingerprint": fingerprint}).json()["exemplars"]]
+from ramen_foundry import RemoteForgeMemoryStore
+memory = RemoteForgeMemoryStore(base_url="https://ramen-forge.ramenai.workers.dev", domain="fintech")
 ```
 
-`fingerprint` is `ramen_foundry.core.memory.fingerprint_task(task)`. Contributing a local exemplar:
-
-```python
-record = exemplar.to_dict() | {"domain": "fintech", "task_description": task}
-httpx.post("https://<your-forge>/api/v1/exemplars", json=record, headers={"Authorization": f"Bearer {token}"})
-```
+Pass it to `RamenSteerNode(memory_store=memory)`. Add `write_token=...` to contribute repairs back to the commons.

@@ -8,7 +8,7 @@
  * stored and later injected into other agents' context windows.
  */
 import { sha256Hex } from "@ramen-ai/node-core";
-import type { CorrectionExemplarInput, JsonObject, JsonValue } from "./types";
+import type { CalibrateRequest, CorrectionExemplarInput, JsonObject, JsonValue } from "./types";
 
 export const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ARGUMENTS_BYTES = 16 * 1024;
@@ -259,3 +259,44 @@ export function parseStoredObject(raw: string): JsonObject {
 }
 
 export const QUERY_PATTERNS = { DOMAIN_RE, TOOL_NAME_RE, SHA256_HEX_RE };
+
+export const MAX_QUERY_LENGTH = 100;
+
+/** Validate a free-text search term. Returns the trimmed term or an error message. */
+export function checkSearchTerm(raw: string): { ok: true; term: string } | { ok: false; error: string } {
+  const term = raw.trim();
+  if (term === "") return { ok: false, error: "q must not be blank" };
+  if (term.length > MAX_QUERY_LENGTH) return { ok: false, error: `q must be at most ${MAX_QUERY_LENGTH} characters` };
+  if (CONTROL_CHAR_RE.test(term)) return { ok: false, error: "q must not contain control characters" };
+  return { ok: true, term };
+}
+
+/** Build a `%term%` LIKE pattern with `%`, `_` and `\` escaped (use with ESCAPE '\'). */
+export function toLikePattern(term: string): string {
+  return `%${term.replace(/[\\%_]/g, "\\$&")}%`;
+}
+
+export const MAX_CALIBRATE_BODY_BYTES = MAX_ARGUMENTS_BYTES + 1024;
+const CALIBRATE_KEYS = new Set(["domain", "tool", "arguments"]);
+
+/** Validate the untrusted body of POST /api/v1/calibrate. Domain-to-bundle mapping is the caller's job. */
+export function validateCalibrateRequest(
+  payload: unknown,
+): { ok: true; value: CalibrateRequest } | { ok: false; errors: string[] } {
+  if (!isPlainObject(payload)) return { ok: false, errors: ["payload must be a JSON object"] };
+  const errors: string[] = [];
+  const unknownKeys = Object.keys(payload).filter((key) => !CALIBRATE_KEYS.has(key));
+  if (unknownKeys.length > 0) errors.push(`unknown fields rejected: ${unknownKeys.slice(0, 10).join(", ")}`);
+
+  const { domain, tool } = payload;
+  if (typeof domain !== "string" || !DOMAIN_RE.test(domain)) {
+    errors.push("domain must be a lowercase slug (a-z, 0-9, '_' or '-', 2-64 characters)");
+  }
+  if (typeof tool !== "string" || !TOOL_NAME_RE.test(tool)) {
+    errors.push("tool must be 1-128 characters of [A-Za-z0-9_.:/-]");
+  }
+  const args = checkArguments(payload.arguments, "arguments", errors, []);
+
+  if (errors.length > 0 || args === null) return { ok: false, errors };
+  return { ok: true, value: { domain: domain as string, tool: tool as string, arguments: args } };
+}

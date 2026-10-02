@@ -3,6 +3,15 @@ export interface Env {
   DB: D1Database;
   /** Bearer token required by write endpoints. Unset means writes are disabled. */
   FORGE_WRITE_TOKEN?: string;
+  /** Enterprise ramen-ai API key used by the community calibration proxy. */
+  RAMEN_API_KEY?: string;
+}
+
+/** Validated body of POST /api/v1/calibrate. */
+export interface CalibrateRequest {
+  domain: string;
+  tool: string;
+  arguments: JsonObject;
 }
 
 export type JsonObject = { [key: string]: JsonValue };

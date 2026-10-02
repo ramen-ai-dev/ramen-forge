@@ -6,10 +6,20 @@
  * back so agents can avoid known failure modes on their first attempt.
  */
 import { Hono, type Context } from "hono";
+import { DOMAIN_BUNDLES, consumeRateLimit, evaluateCalibration } from "./calibrate";
 import { renderConsole } from "./console";
 import { SEED_BANK } from "./seed";
 import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
-import { MAX_BODY_BYTES, QUERY_PATTERNS, parseStoredObject, validateExemplar } from "./validation";
+import {
+  MAX_BODY_BYTES,
+  MAX_CALIBRATE_BODY_BYTES,
+  QUERY_PATTERNS,
+  checkSearchTerm,
+  parseStoredObject,
+  toLikePattern,
+  validateCalibrateRequest,
+  validateExemplar,
+} from "./validation";
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -88,14 +98,17 @@ async function authoriseWrite(c: AppContext): Promise<Response | null> {
   return null;
 }
 
-async function readJsonBody(c: AppContext): Promise<{ ok: true; body: unknown } | { ok: false; response: Response }> {
+async function readJsonBody(
+  c: AppContext,
+  maxBytes: number = MAX_BODY_BYTES,
+): Promise<{ ok: true; body: unknown } | { ok: false; response: Response }> {
   const declared = Number(c.req.header("content-length") ?? "0");
-  if (declared > MAX_BODY_BYTES) {
-    return { ok: false, response: c.json({ success: false, error: `body exceeds ${MAX_BODY_BYTES} bytes` }, 413) };
+  if (declared > maxBytes) {
+    return { ok: false, response: c.json({ success: false, error: `body exceeds ${maxBytes} bytes` }, 413) };
   }
   const raw = await c.req.text();
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
-    return { ok: false, response: c.json({ success: false, error: `body exceeds ${MAX_BODY_BYTES} bytes` }, 413) };
+  if (new TextEncoder().encode(raw).byteLength > maxBytes) {
+    return { ok: false, response: c.json({ success: false, error: `body exceeds ${maxBytes} bytes` }, 413) };
   }
   try {
     return { ok: true, body: JSON.parse(raw) };
@@ -148,7 +161,9 @@ app.post("/api/v1/exemplars", async (c) => {
 });
 
 app.get("/api/v1/exemplars", async (c) => {
-  const { domain, tool_name: toolName, task_fingerprint: taskFingerprint, limit: rawLimit } = c.req.query();
+  // Every filter is optional and combined with AND. task_fingerprint gives an
+  // exact-task match; q gives a keyword match that works across phrasings.
+  const { domain, tool_name: toolName, task_fingerprint: taskFingerprint, q, limit: rawLimit } = c.req.query();
   const errors: string[] = [];
   const where: string[] = [];
   const params: (string | number)[] = [];
@@ -169,6 +184,19 @@ app.get("/api/v1/exemplars", async (c) => {
     }
     where.push("task_fingerprint = ?");
     params.push(taskFingerprint);
+  }
+  if (q !== undefined) {
+    const search = checkSearchTerm(q);
+    if (!search.ok) {
+      errors.push(search.error);
+    } else {
+      // SQLite LIKE is case-insensitive for ASCII. Wildcards in q are escaped.
+      const pattern = toLikePattern(search.term);
+      where.push(
+        "(task_description LIKE ? ESCAPE '\\' OR violation_rule LIKE ? ESCAPE '\\' OR steering_directive LIKE ? ESCAPE '\\')",
+      );
+      params.push(pattern, pattern, pattern);
+    }
   }
 
   let limit = DEFAULT_LIMIT;
@@ -242,6 +270,52 @@ app.post("/api/v1/seed", async (c) => {
     seed_bank_size: validated.length,
     exemplar_ids: validated.map((e) => e.exemplar_id),
   });
+});
+
+app.post("/api/v1/calibrate", async (c) => {
+  const apiKey = c.env.RAMEN_API_KEY;
+  if (!apiKey) {
+    return c.json({ success: false, error: "calibration disabled: RAMEN_API_KEY is not configured" }, 503);
+  }
+
+  // Count every attempt, valid or not, so malformed floods are throttled too.
+  const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+  const rate = await consumeRateLimit(c.env.DB, ip);
+  c.header("RateLimit-Limit", String(rate.limit));
+  c.header("RateLimit-Remaining", String(rate.remaining));
+  c.header("RateLimit-Reset", String(Math.max(0, Math.ceil(rate.resetAt - Date.now() / 1000))));
+  if (!rate.allowed) {
+    c.header("Retry-After", String(Math.max(1, Math.ceil(rate.resetAt - Date.now() / 1000))));
+    return c.json({ success: false, error: `rate limit exceeded: ${rate.limit} calibrations per hour per client` }, 429);
+  }
+
+  const parsed = await readJsonBody(c, MAX_CALIBRATE_BODY_BYTES);
+  if (!parsed.ok) return parsed.response;
+
+  const request = validateCalibrateRequest(parsed.body);
+  if (!request.ok) {
+    return c.json({ success: false, error: "calibration request rejected", details: request.errors }, 422);
+  }
+  const bundleId = DOMAIN_BUNDLES[request.value.domain];
+  if (!bundleId) {
+    return c.json(
+      {
+        success: false,
+        error: "calibration request rejected",
+        details: [`unsupported domain; expected one of: ${Object.keys(DOMAIN_BUNDLES).join(", ")}`],
+      },
+      422,
+    );
+  }
+
+  const outcome = await evaluateCalibration(apiKey, request.value, bundleId);
+  if (!outcome.ok) {
+    return c.json(
+      { success: false, error: outcome.error, ...(outcome.upstream_status ? { upstream_status: outcome.upstream_status } : {}) },
+      outcome.status,
+    );
+  }
+  return c.json(outcome.body);
 });
 
 app.notFound((c) => c.json({ success: false, error: "not found" }, 404));

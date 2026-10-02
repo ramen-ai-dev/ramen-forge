@@ -1,5 +1,5 @@
 /**
- * Embedded single-page monitoring console served at GET /.
+ * Embedded single-page MOM console served at GET /.
  *
  * All community-contributed text is rendered with textContent (never
  * innerHTML), and the page ships under a nonce-based CSP.
@@ -10,17 +10,24 @@ export function renderConsole(nonce: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RAMEN FORGE · Domain Memory Engine</title>
+<title>RAMEN FORGE · The Moral Memory Engine</title>
+<meta name="description" content="Every agent needs a MOM. Agents forget. MOM remembers.">
+<link rel="icon" href="data:,">
 <script nonce="${nonce}" src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-full bg-zinc-950 text-zinc-100 font-sans antialiased">
 <a href="#main" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 bg-amber-400 text-zinc-950 px-3 py-2 rounded">Skip to content</a>
 <header class="border-b border-zinc-800">
-  <div class="max-w-6xl mx-auto px-6 py-6">
-    <h1 class="text-2xl font-semibold tracking-tight">
-      <span class="text-amber-400">RAMEN FORGE:</span> Autonomous Agent Domain Memory Engine
+  <div class="max-w-6xl mx-auto px-6 py-8">
+    <h1 class="text-3xl font-semibold tracking-tight">
+      <span class="text-amber-400">RAMEN FORGE:</span> The Moral Memory Engine
     </h1>
-    <p class="mt-1 text-sm text-zinc-400">Level 1 Community Memory Commons. Normalised correction exemplars served to agents before tool dispatch.</p>
+    <p class="mt-2 text-lg text-zinc-300">Every agent needs a MOM. <span class="text-zinc-400">Agents forget.</span> <span class="text-amber-300 font-medium">MOM remembers.</span></p>
+  </div>
+  <div class="bg-amber-400/10 border-t border-amber-400/20">
+    <p class="max-w-6xl mx-auto px-6 py-3 text-sm text-amber-100">
+      Every agent gets a fresh context; your organisation shouldn't. Persistent domain memory capturing real-world mistakes, steering corrections, and cryptographic receipts.
+    </p>
   </div>
 </header>
 
@@ -29,7 +36,7 @@ export function renderConsole(nonce: string): string {
     <h2 id="stats-heading" class="sr-only">Live statistics</h2>
     <div class="grid gap-4 sm:grid-cols-3" aria-live="polite">
       <div class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
-        <p class="text-xs uppercase tracking-wider text-zinc-400">Total Community Exemplars</p>
+        <p class="text-xs uppercase tracking-wider text-zinc-400">Total Exemplars</p>
         <p id="stat-total" class="mt-2 text-3xl font-semibold">–</p>
       </div>
       <div class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
@@ -38,22 +45,35 @@ export function renderConsole(nonce: string): string {
         <p id="stat-domain-list" class="mt-1 text-xs text-zinc-400"></p>
       </div>
       <div class="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
-        <p class="text-xs uppercase tracking-wider text-zinc-400">Recovery Rate (receipt-verified)</p>
+        <p class="text-xs uppercase tracking-wider text-zinc-400">Community Recovery Rate</p>
         <p id="stat-recovery" class="mt-2 text-3xl font-semibold">–</p>
         <p class="mt-1 text-xs text-zinc-400">Share of exemplars anchored to a ramen-ai receipt.</p>
       </div>
     </div>
-    <p id="status" class="mt-3 text-xs text-zinc-500" role="status"></p>
   </section>
 
   <section aria-labelledby="stream-heading">
-    <div class="flex items-baseline justify-between">
-      <h2 id="stream-heading" class="text-lg font-semibold">Live Stream</h2>
-      <p class="text-xs text-zinc-500">Refreshes every 15 seconds</p>
+    <div class="flex flex-wrap items-baseline justify-between gap-2">
+      <h2 id="stream-heading" class="text-lg font-semibold">Domain Memory</h2>
+      <p id="status" class="text-xs text-zinc-500" role="status"></p>
     </div>
+
+    <div class="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center">
+      <label for="search" class="sr-only">Search domain memory</label>
+      <input id="search" type="search" autocomplete="off" maxlength="100"
+        placeholder="Search domain memory (e.g. wire, burner, adverse action)..."
+        class="w-full sm:flex-1 rounded-md border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm placeholder-zinc-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400">
+      <div id="chips" role="group" aria-label="Filter by domain" class="flex flex-wrap gap-2">
+        <button type="button" data-domain="" aria-pressed="true">All</button>
+        <button type="button" data-domain="fintech" aria-pressed="false">FinTech</button>
+        <button type="button" data-domain="industrial_iot" aria-pressed="false">Industrial IoT</button>
+        <button type="button" data-domain="devsecops" aria-pressed="false">DevSecOps</button>
+      </div>
+    </div>
+
     <div class="mt-3 overflow-x-auto rounded-lg border border-zinc-800">
       <table class="min-w-full text-sm">
-        <caption class="sr-only">Recently contributed structural lessons, newest first</caption>
+        <caption class="sr-only">Exemplars matching the current search and domain filter, newest first</caption>
         <thead class="bg-zinc-900 text-left text-xs uppercase tracking-wider text-zinc-400">
           <tr>
             <th scope="col" class="px-4 py-3">Domain</th>
@@ -71,7 +91,7 @@ export function renderConsole(nonce: string): string {
 
   <section aria-labelledby="quickstart-heading">
     <h2 id="quickstart-heading" class="text-lg font-semibold">Integration Quickstart</h2>
-    <p class="mt-1 text-sm text-zinc-400">Pull prior repairs into a ramen-foundry agent before its first tool call. Records rehydrate directly into <code class="text-amber-300">CorrectionExemplar</code>.</p>
+    <p class="mt-1 text-sm text-zinc-400">Give a ramen-foundry agent a MOM. Pass the store to <code class="text-amber-300">RamenSteerNode(memory_store=memory)</code> and prior repairs are recalled before the first tool call.</p>
     <div class="mt-3 relative rounded-lg border border-zinc-800 bg-zinc-900">
       <button id="copy" type="button" class="absolute top-2 right-2 rounded bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400" aria-describedby="copy-status">Copy</button>
       <pre class="overflow-x-auto p-4 pr-20 text-xs leading-relaxed"><code id="quickstart"></code></pre>
@@ -82,21 +102,35 @@ export function renderConsole(nonce: string): string {
 
 <script nonce="${nonce}">
 (() => {
-  const origin = window.location.origin;
+  const $ = (id) => document.getElementById(id);
   const quickstart =
-    'import httpx; from ramen_foundry import CorrectionExemplar\\n' +
-    'lessons = [CorrectionExemplar.from_dict(e) for e in httpx.get("' + origin + '/api/v1/exemplars", params={"tool_name": tool_name, "task_fingerprint": fingerprint}).json()["exemplars"]]';
-  document.getElementById("quickstart").textContent = quickstart;
+    'from ramen_foundry import RemoteForgeMemoryStore\\n' +
+    'memory = RemoteForgeMemoryStore(base_url="' + window.location.origin + '", domain="fintech")';
+  $("quickstart").textContent = quickstart;
 
-  document.getElementById("copy").addEventListener("click", async () => {
-    const status = document.getElementById("copy-status");
+  $("copy").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(quickstart);
-      status.textContent = "Copied to clipboard.";
+      $("copy-status").textContent = "Copied to clipboard.";
     } catch {
-      status.textContent = "Copy failed. Select the snippet manually.";
+      $("copy-status").textContent = "Copy failed. Select the snippet manually.";
     }
   });
+
+  const CHIP_BASE = "rounded-full border px-3 py-1 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ";
+  const CHIP_ON = CHIP_BASE + "border-amber-400 bg-amber-400 text-zinc-950 font-medium";
+  const CHIP_OFF = CHIP_BASE + "border-zinc-700 bg-zinc-900 text-zinc-300 hover:border-zinc-500";
+  const chips = Array.from(document.querySelectorAll("#chips button"));
+  const state = { q: "", domain: "" };
+
+  const paintChips = () => {
+    for (const chip of chips) {
+      const on = chip.dataset.domain === state.domain;
+      chip.setAttribute("aria-pressed", String(on));
+      chip.className = on ? CHIP_ON : CHIP_OFF;
+    }
+  };
+  paintChips();
 
   const cell = (text, extra) => {
     const td = document.createElement("td");
@@ -105,34 +139,45 @@ export function renderConsole(nonce: string): string {
     return td;
   };
 
-  async function refresh() {
-    const status = document.getElementById("status");
+  async function loadStats() {
     try {
-      const [statsRes, streamRes] = await Promise.all([
-        fetch("/api/v1/stats", { headers: { accept: "application/json" } }),
-        fetch("/api/v1/exemplars?limit=25", { headers: { accept: "application/json" } }),
-      ]);
-      if (!statsRes.ok || !streamRes.ok) throw new Error("HTTP " + statsRes.status + "/" + streamRes.status);
-      const stats = await statsRes.json();
-      const stream = await streamRes.json();
+      const res = await fetch("/api/v1/stats", { headers: { accept: "application/json" } });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const stats = await res.json();
+      $("stat-total").textContent = String(stats.total_community_exemplars);
+      $("stat-domains").textContent = String(stats.active_domains);
+      $("stat-domain-list").textContent = stats.domains.map((d) => d.domain + " (" + d.exemplars + ")").join(" · ");
+      $("stat-recovery").textContent = (stats.recovery_rate * 100).toFixed(1) + "%";
+    } catch (err) {
+      $("status").textContent = "Stats unavailable: " + err.message;
+    }
+  }
 
-      document.getElementById("stat-total").textContent = String(stats.total_community_exemplars);
-      document.getElementById("stat-domains").textContent = String(stats.active_domains);
-      document.getElementById("stat-domain-list").textContent =
-        stats.domains.map((d) => d.domain + " (" + d.exemplars + ")").join(" · ");
-      document.getElementById("stat-recovery").textContent =
-        (stats.recovery_rate * 100).toFixed(1) + "%";
+  let inflight = null;
+  async function loadExemplars() {
+    if (inflight) inflight.abort();
+    inflight = new AbortController();
+    const params = new URLSearchParams({ limit: "50" });
+    if (state.q) params.set("q", state.q);
+    if (state.domain) params.set("domain", state.domain);
+    try {
+      const res = await fetch("/api/v1/exemplars?" + params, {
+        headers: { accept: "application/json" },
+        signal: inflight.signal,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error((data.details && data.details[0]) || data.error || "HTTP " + res.status);
 
-      const body = document.getElementById("stream");
+      const body = $("stream");
       body.replaceChildren();
-      if (stream.exemplars.length === 0) {
+      if (data.exemplars.length === 0) {
         const tr = document.createElement("tr");
-        const td = cell("No exemplars yet. POST /api/v1/seed to load the seed bank.", "text-center text-zinc-500");
+        const td = cell(state.q || state.domain ? "No lessons match this search yet." : "No exemplars yet.", "text-center text-zinc-500");
         td.colSpan = 4;
         tr.append(td);
         body.append(tr);
       }
-      for (const e of stream.exemplars) {
+      for (const e of data.exemplars) {
         const tr = document.createElement("tr");
         tr.append(
           cell(e.domain, "whitespace-nowrap text-amber-300"),
@@ -142,14 +187,33 @@ export function renderConsole(nonce: string): string {
         );
         body.append(tr);
       }
-      status.textContent = "Updated " + new Date().toLocaleTimeString();
+      $("status").textContent = data.count + (data.count === 1 ? " lesson" : " lessons") + " · updated " + new Date().toLocaleTimeString();
     } catch (err) {
-      status.textContent = "Refresh failed: " + err.message;
+      if (err.name === "AbortError") return;
+      $("status").textContent = "Search failed: " + err.message;
     }
   }
 
-  refresh();
-  setInterval(refresh, 15000);
+  let debounce;
+  $("search").addEventListener("input", (event) => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      state.q = event.target.value.trim();
+      loadExemplars();
+    }, 200);
+  });
+
+  for (const chip of chips) {
+    chip.addEventListener("click", () => {
+      state.domain = chip.dataset.domain;
+      paintChips();
+      loadExemplars();
+    });
+  }
+
+  loadStats();
+  loadExemplars();
+  setInterval(() => { loadStats(); loadExemplars(); }, 30000);
 })();
 </script>
 </body>
