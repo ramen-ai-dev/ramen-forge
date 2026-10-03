@@ -1,19 +1,19 @@
-# ramen-forge
+# ramen forge: The Moral Memory Engine (MOM)
 
-Cloud memory synchronisation and domain-hardening engine for autonomous agents.
+Every agent gets a fresh context; your organisation shouldn't.
 
-ramen-forge is the **Level 1 Community Memory Commons**. It ingests normalised `CorrectionExemplar` records produced by [ramen-foundry](https://github.com/ramen-ai-dev/ramen-foundry) agents, indexes them by domain, tool, and task fingerprint in Cloudflare D1, and serves them back over HTTP so agents can load known repairs into context before their first tool dispatch.
+ramen forge is the Level 1 Community Moral Memory (MOM) Engine for autonomous agents. It stores verified domain lessons, statutory invariants, and compliant parameter blueprints in Cloudflare D1, serving them back over HTTP so agents load codified regulatory constraints into context before their first tool dispatch.
 
 ## Architecture
 
 ```
 ┌──────────────────────────┐   POST /api/v1/exemplars   ┌──────────────────────────┐
-│  Client Agent            │ ─────────────────────────▶ │  ramen-forge             │
-│  (ramen-foundry)         │                            │  Cloud Memory (Worker+D1)│
+│  Client Agent            │ ─────────────────────────▶ │  ramen forge             │
+│  (ramen foundry)         │                            │  Cloud Memory (Worker+D1)│
 │  JSONFileMemoryStore /   │ ◀───────────────────────── │  Level 1 community tier  │
 │  SQLiteMemoryStore (L0)  │   GET /api/v1/exemplars    └──────────────────────────┘
 └────────────┬─────────────┘
-             │ tool call (with recalled exemplars in context)
+             │ tool call informed by retrieved lessons
              ▼
 ┌──────────────────────────┐
 │  ramen ai                │  Stateless policy boundary: evaluates each call,
@@ -22,30 +22,31 @@ ramen-forge is the **Level 1 Community Memory Commons**. It ingests normalised `
 └──────────────────────────┘
 ```
 
-1. A foundry agent's tool call is blocked by the ramen ai policy boundary.
-2. The agent repairs the call using the steering directive, and the repaired call is allowed.
-3. Foundry records a `CorrectionExemplar` locally (Level 0) and can contribute it to ramen-forge (Level 1).
-4. Before Turn 1 on a later task, any agent queries ramen-forge by `domain` / `tool_name` / keyword (`q`) / `task_fingerprint` and starts with the repair already in context.
+1. Prior to Turn 1, an agent queries ramen forge by domain, tool name, or keyword (q).
+2. ramen forge returns the relevant statutory invariant and compliant parameter blueprint.
+3. The agent ingests the directive into its working instructions, constructing a compliant tool call on its first attempt.
+4. The stateless ramen ai execution boundary evaluates the call pre-dispatch, releases execution, and mints an unalterable Schema V5 Ed25519 receipt.
+5. If a novel operational edge case is evaluated and allowed, the verified lesson can be contributed to ramen forge (Level 1) to protect other agents across the network.
 
-ramen ai stays stateless. Memory lives on the client (Level 0) or in ramen-forge (Level 1/2), never in the policy boundary.
+ramen ai remains strictly stateless. Memory lives on the client (Level 0) or in ramen forge (Level 1/2), never in the policy boundary.
 
 ## Memory taxonomy
 
 | Level | Tier | Where it lives | Scope |
 | --- | --- | --- | --- |
-| 0 | local | ramen-foundry `JSONFileMemoryStore` / `SQLiteMemoryStore` | One agent or host. Never leaves the machine. |
-| 1 | community | ramen-forge, `tier = 'community'` | Shared, sanitised exemplars across all contributing agents. |
-| 2 | enterprise | ramen-forge, `tier = 'enterprise'` | Reserved for organisation-scoped exemplars. Schema supports it; no API writes this tier yet. |
+| 0 | local | ramen foundry `JSONFileMemoryStore` / `SQLiteMemoryStore` | One agent or host. Never leaves the machine. |
+| 1 | community | ramen forge, `tier = 'community'` | Shared, sanitised lessons and blueprints across all contributing agents. |
+| 2 | enterprise | ramen forge, `tier = 'enterprise'` | Reserved for organisation-scoped lessons. Schema supports it; no API writes this tier yet. |
 
 ## API
 
-Records use the same field names as foundry's `CorrectionExemplar.to_dict()`, plus `domain` and `task_description`. In D1, `exemplar_id` is stored as `id`, `violation_reason` as `violation_rule`, and argument objects as `*_json` text columns.
+Records use the same field names as ramen foundry's `CorrectionExemplar.to_dict()`, plus `domain` and `task_description`. In D1, `exemplar_id` is stored as `id`, `violation_reason` as `violation_rule`, and argument objects as `*_json` text columns.
 
 ### `POST /api/v1/exemplars` (auth required)
 
-Ingests one exemplar. Returns `201 { "success": true, "exemplar_id": "<uuid>" }`.
+Ingests one verified domain lesson. Requires a full Schema V5 receipt with signed verdict=1. Returns `201 { "success": true, "exemplar_id": "<uuid>" }`.
 
-Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset), `receipt` (the full Schema V5 receipt object from the ramen-ai evaluation of the repaired call). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `receipt_id` (must equal `receipt.id`), `task_fingerprint`.
+Required: `exemplar_id` (UUID), `domain` (lowercase slug, e.g. `fintech`), `task_description`, `tool_name`, `violation_reason`, `primary_statutory_anchor`, `steering_directive`, `repaired_arguments` (object), `created_at` (ISO 8601 with offset), `receipt` (the full Schema V5 receipt object from the ramen-ai evaluation of the compliant tool call or verified repair). Optional: `failed_arguments` (object; stored as `{}` when omitted or null), `receipt_id` (must equal `receipt.id`), `task_fingerprint`.
 
 The receipt is checked before anything else, in `src/receipt.ts`:
 
@@ -78,7 +79,7 @@ A duplicate `exemplar_id` for a different invariant returns `409`. Everything in
 
 ### `GET /api/v1/exemplars`
 
-Query parameters, all optional and combined with AND: `domain`, `tool_name`, `task_fingerprint`, `q`, `limit` (1–50, default 10), `offset` (0–10000, default 0). Returns `{ "success": true, "count": n, "limit": n, "offset": n, "exemplars": [...] }`, newest first.
+Query parameters, all optional and combined with AND: `domain`, `tool_name`, `task_fingerprint`, `q`, `limit` (1–50, default 10), `offset` (0–10000, default 0). Returns verified domain lessons and compliant blueprints as `{ "success": true, "count": n, "limit": n, "offset": n, "exemplars": [...] }`, newest first.
 
 When a query that includes `domain` returns nothing on the first page (`offset=0`), the miss is logged to `domain_demand` (domain, tool_name, q, SHA-256 of the client IP) after the response is sent. Identical misses from one client are recorded once per UTC hour.
 
@@ -118,7 +119,7 @@ The upstream is `${RAMEN_GATEWAY_URL}/api/v1/paas/evaluate` (default `https://ap
 
 ### `GET /skill.md`
 
-Machine onboarding protocol (`text/markdown`): when to query the forge before a consequential tool call, how to use retrieved directives, and how to report a repaired call with its Schema V5 receipt.
+Machine onboarding protocol (`text/markdown`): when to query ramen forge before a consequential tool call, how to use retrieved directives, and how to report a compliant tool call or verified repair with its Schema V5 receipt.
 
 ### `GET /api/v1/stats`
 
@@ -134,7 +135,7 @@ MOM console ("Agents forget. MOM remembers."): live stats, keyword search and do
 
 `/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 
-Exemplars are injected into other agents' context windows, so treat retrieved records as untrusted guidance: the ramen ai policy boundary still evaluates every repaired call. The validator blocks common credential shapes but is not a full DLP scanner; sanitise arguments before contributing.
+Exemplars are injected into other agents' context windows, so treat retrieved records as untrusted guidance: the ramen ai policy boundary still evaluates every compliant tool call or verified repair. The validator blocks common credential shapes but is not a full DLP scanner; sanitise arguments before contributing.
 
 ## Setup
 
@@ -155,7 +156,7 @@ cp .dev.vars.example .dev.vars   # then edit FORGE_WRITE_TOKEN
 npm run dev
 ```
 
-There is no seed data. The forge only holds exemplars contributed from live ramen-ai evaluations.
+There is no seed data. ramen forge only holds verified domain lessons contributed from live ramen-ai evaluations.
 
 Deploy:
 
@@ -170,11 +171,20 @@ For local calibrate testing, add `RAMEN_API_KEY` to `.dev.vars`.
 
 Typecheck with `npx tsc --noEmit`.
 
-## Quickstart from a ramen-foundry agent
+## Quickstart from a ramen foundry agent
 
 ```python
-from ramen_foundry import RemoteForgeMemoryStore
-memory = RemoteForgeMemoryStore(base_url="https://ramen-forge.ramenai.workers.dev", domain="fintech")
+# Retrieve verified domain lessons before first tool dispatch
+import httpx
+from ramen_foundry import CorrectionExemplar
+
+lessons = [
+    CorrectionExemplar.from_dict(e)
+    for e in httpx.get(
+        "https://forge.ramenai.dev/api/v1/exemplars",
+        params={"domain": "fintech", "tool_name": "dispatch_wire"}
+    ).json()["exemplars"]
+]
 ```
 
-Pass it to `RamenSteerNode(memory_store=memory)`. Add `write_token=...` to contribute repairs back to the commons.
+Use `lessons` to load the retrieved directives into the agent's working instructions before dispatch. Add a write token when contributing a verified domain lesson to the commons.
