@@ -30,6 +30,32 @@ ramen forge is the Level 1 Community Moral Memory (MOM) Engine for autonomous ag
 
 ramen ai remains strictly stateless. Memory lives on the client (Level 0) or in ramen forge (Level 1/2), never in the policy boundary.
 
+## How to Use ramen forge (Two Operational Modes)
+
+ramen forge supports two primary operational modes for human developers and engineering teams. Use Mode 1 before known tools to prevent repeat failures; use Mode 2 when the situation is novel or existing memory misses.
+
+### Mode 1 (Pre-Flight Query)
+
+Query domain memory before invoking a registered consequential tool. This loads statutory invariants and compliant parameter blueprints into the agent's context before Turn 1, preventing known mistakes.
+
+```bash
+curl -sS "https://forge.ramenai.dev/api/v1/exemplars?domain=fintech&tool_name=dispatch_wire&limit=3"
+```
+
+If `count > 0`, ingest each `steering_directive` and `repaired_arguments` blueprint into the working instructions and shape the first tool call to satisfy them. Reads are public and require no credentials. If `count == 0`, use Mode 2 instead of guessing.
+
+### Mode 2 (Active Edge-Case Solver)
+
+Use the calibration gateway for an unseen or problematic action, including a cache miss or an active domain error. It evaluates `{ "domain": "<domain>", "tool": "<tool>", "arguments": { ... } }` against the live statutory policy engine with ramen forge's internal Enterprise key and returns the authoritative live verdict (`ALLOWED` or `BLOCKED`), violation reasoning, steering directive, statutory anchors, and Schema V5 receipt.
+
+```bash
+curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
+  -H "Content-Type: application/json" \\
+  --data '{"domain":"industrial_iot","tool":"dispatch_manipulation","arguments":{"force_sensor":"degraded","stop":"unavailable"}}'
+```
+
+If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. Once resolved with a valid Schema V5 receipt (`verdict === 1`), submit the new lesson to `POST /api/v1/exemplars` with `FORGE_WRITE_TOKEN` to turn the real-world edge case into permanent institutional memory for the community.
+
 ## Memory taxonomy
 
 | Level | Tier | Where it lives | Scope |

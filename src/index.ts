@@ -294,7 +294,7 @@ app.get("/api/v1/exemplars", async (c) => {
     limit: rawLimit,
     offset: rawOffset,
   } = c.req.query();
-  let searchTerm: string | null = null;
+  let demandQuery: string | null = null;
   const errors: string[] = [];
   const where: string[] = [];
   const params: (string | number)[] = [];
@@ -322,12 +322,13 @@ app.get("/api/v1/exemplars", async (c) => {
       errors.push(search.error);
     } else {
       // SQLite LIKE is case-insensitive for ASCII. Wildcards in q are escaped.
-      searchTerm = search.term;
-      const pattern = toLikePattern(search.term);
+      const normalizedQuery = search.term.trim();
+      const searchTerm = toLikePattern(normalizedQuery);
+      demandQuery = normalizedQuery;
       where.push(
         "(task_description LIKE ? ESCAPE '\\' OR violation_rule LIKE ? ESCAPE '\\' OR steering_directive LIKE ? ESCAPE '\\')",
       );
-      params.push(pattern, pattern, pattern);
+      params.push(searchTerm, searchTerm, searchTerm);
     }
   }
 
@@ -353,17 +354,39 @@ app.get("/api/v1/exemplars", async (c) => {
     "SELECT * FROM exemplars" +
     (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
     " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?";
-  const { results } = await c.env.DB.prepare(sql)
-    .bind(...params, limit, offset)
-    .all<ExemplarRow>();
+  let results: ExemplarRow[];
+  try {
+    const response = await c.env.DB.prepare(sql)
+      .bind(...params, limit, offset)
+      .all<ExemplarRow>();
+    results = response.results;
+  } catch (error) {
+    console.error("ramen-forge exemplar search failed", error);
+    return c.json({ success: true, count: 0, limit, offset, exemplars: [] });
+  }
 
   // A first-page miss on a domain is unmet demand. Paging past the end is not.
   if (results.length === 0 && domain !== undefined && offset === 0) {
     const ip = c.req.header("cf-connecting-ip") ?? "unknown";
-    c.executionCtx.waitUntil(logDemand(c.env.DB, ip, domain, toolName ?? null, searchTerm));
+    try {
+      const executionContext = c.executionCtx;
+      if (executionContext && typeof executionContext.waitUntil === "function") {
+        executionContext.waitUntil(logDemand(c.env.DB, ip, domain, toolName ?? null, demandQuery));
+      } else {
+        void logDemand(c.env.DB, ip, domain, toolName ?? null, demandQuery);
+      }
+    } catch (error) {
+      console.error("ramen-forge demand scheduling failed", error);
+    }
   }
 
-  const exemplars = results.map(toRecord);
+  let exemplars: CorrectionExemplarRecord[];
+  try {
+    exemplars = results.map(toRecord);
+  } catch (error) {
+    console.error("ramen-forge exemplar conversion failed", error);
+    return c.json({ success: true, count: 0, limit, offset, exemplars: [] });
+  }
   return c.json({ success: true, count: exemplars.length, limit, offset, exemplars });
 });
 
