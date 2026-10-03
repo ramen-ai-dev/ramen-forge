@@ -70,11 +70,17 @@ Payloads are rejected with `422` and a list of reasons when they:
 - include control characters, a `task_fingerprint` that is not `SHA-256(task_description)`, or a future `created_at`
 - appear to contain credentials (private keys, AWS keys, GitHub/Slack tokens, JWTs, bearer tokens, `sk-` API keys)
 
-Duplicate `exemplar_id` returns `409`. Everything ingested is stored as `tier = 'community'`.
+The verified `receipt.signature` and `receipt.canonical_payload` are stored in the `signature` and `canonical_payload` columns and returned by `GET /api/v1/exemplars`, so anyone can re-verify a lesson offline against `ramen_pk_v1`.
+
+Lessons are unique on `(domain, tool_name, task_fingerprint, violation_reason)` (index `idx_exemplars_task_invariant`, migration `0004`). The task is part of the key because distinct lessons can share `violation_reason` text, such as several compliant reference actions on one tool. Submitting a lesson for an invariant that already exists returns `200 { "success": true, "exemplar_id": "<existing id>", "refreshed": true }`: the existing row keeps its id and lesson text, and only `receipt_id`, `signature`, and `canonical_payload` are replaced with the new verified receipt. This is an `ON CONFLICT ... DO UPDATE` upsert, not `INSERT OR REPLACE`, because `REPLACE` deletes the old row and would bypass the append-only trigger.
+
+A duplicate `exemplar_id` for a different invariant returns `409`. Everything ingested is stored as `tier = 'community'`.
 
 ### `GET /api/v1/exemplars`
 
-Query parameters, all optional and combined with AND: `domain`, `tool_name`, `task_fingerprint`, `q`, `limit` (1–50, default 10). Returns `{ "success": true, "count": n, "exemplars": [...] }`, newest first.
+Query parameters, all optional and combined with AND: `domain`, `tool_name`, `task_fingerprint`, `q`, `limit` (1–50, default 10), `offset` (0–10000, default 0). Returns `{ "success": true, "count": n, "limit": n, "offset": n, "exemplars": [...] }`, newest first.
+
+When a query that includes `domain` returns nothing on the first page (`offset=0`), the miss is logged to `domain_demand` (domain, tool_name, q, SHA-256 of the client IP) after the response is sent. Identical misses from one client are recorded once per UTC hour.
 
 - `task_fingerprint` matches one exact task phrasing.
 - `q` (≤ 100 characters) is a case-insensitive keyword match across `task_description`, `violation_reason`, and `steering_directive`, so lessons are shared across different phrasings of the same task. `%` and `_` are matched literally.
@@ -106,7 +112,13 @@ A global ceiling of 500 upstream evaluations per UTC hour, across all clients, p
 
 ```json
 { "success": false, "error": { "code": "COMMUNITY_CAPACITY_REACHED", "message": "Global community calibration capacity reached for this hour (500/500). ..." } }
-``` Upstream failures return `502` / `504` without relaying the upstream body. Returns `503` if `RAMEN_API_KEY` is not set.
+``` Upstream failures return `502` / `504` without relaying the upstream body. Returns `503` if `RAMEN_API_KEY` is not set or `RAMEN_GATEWAY_URL` is not a plain `https` origin.
+
+The upstream is `${RAMEN_GATEWAY_URL}/api/v1/paas/evaluate` (default `https://api.ramenai.dev`). `wrangler.toml` sets it to the gateway Worker's `workers.dev` hostname, because on `forge.ramenai.dev` subrequests to `api.ramenai.dev` (same zone) fail with `522`.
+
+### `GET /skill.md`
+
+Machine onboarding protocol (`text/markdown`): when to query the forge before a consequential tool call, how to use retrieved directives, and how to report a repaired call with its Schema V5 receipt.
 
 ### `GET /api/v1/stats`
 
@@ -118,7 +130,7 @@ MOM console ("Agents forget. MOM remembers."): live stats, keyword search and do
 
 ## Authentication and trust
 
-`POST /api/v1/exemplars` requires `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints, `/api/v1/calibrate`, and the console are public.
+`POST /api/v1/exemplars` requires `Authorization: Bearer <FORGE_WRITE_TOKEN>`. If the secret is not set, writes return `503` (fail closed). Read endpoints, `/api/v1/calibrate`, `/skill.md`, and the console are public. `/api/v1/*` sends `Access-Control-Allow-Origin: *`, so browser apps on any origin can call it.
 
 `/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 

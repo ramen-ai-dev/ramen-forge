@@ -5,7 +5,22 @@
 import { verifyReceipt, type EvaluationResponse, type RamenReceipt } from "@ramen-ai/node-core";
 import type { CalibrateRequest } from "./types";
 
-export const RAMEN_EVALUATE_URL = "https://api.ramenai.dev/api/v1/paas/evaluate";
+export const DEFAULT_RAMEN_GATEWAY_URL = "https://api.ramenai.dev";
+const EVALUATE_PATH = "/api/v1/paas/evaluate";
+
+/**
+ * Resolve the evaluate endpoint from RAMEN_GATEWAY_URL. Only https origins are
+ * accepted, because the Enterprise API key is sent to this URL. An invalid
+ * value throws, so a misconfiguration fails loudly instead of leaking the key.
+ */
+export function resolveEvaluateUrl(gatewayUrl: string | undefined): string {
+  const raw = gatewayUrl?.trim() || DEFAULT_RAMEN_GATEWAY_URL;
+  const url = new URL(raw);
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new Error("RAMEN_GATEWAY_URL must be a plain https origin");
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}${EVALUATE_PATH}`;
+}
 export const CALIBRATE_LIMIT_PER_HOUR = 50;
 const HOUR_MS = 60 * 60 * 1000;
 const UPSTREAM_TIMEOUT_MS = 20_000;
@@ -73,9 +88,14 @@ export interface RateLimitDecision {
   resetAt: number;
 }
 
-async function hashClientKey(ip: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`calibrate:${ip}`));
+/** SHA-256 hex of `${purpose}:${ip}`. Raw IPs are never stored. */
+export async function hashClientIp(purpose: string, ip: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${purpose}:${ip}`));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function hashClientKey(ip: string): Promise<string> {
+  return hashClientIp("calibrate", ip);
 }
 
 /**
@@ -131,12 +151,13 @@ export async function evaluateCalibration(
   apiKey: string,
   request: CalibrateRequest,
   bundleId: string,
+  evaluateUrl: string,
 ): Promise<CalibrateOutcome> {
   const input = JSON.stringify({ tool: request.tool, arguments: request.arguments });
 
   let res: Response;
   try {
-    res = await fetch(RAMEN_EVALUATE_URL, {
+    res = await fetch(evaluateUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

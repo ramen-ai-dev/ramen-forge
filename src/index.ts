@@ -6,17 +6,22 @@
  * back so agents can avoid known failure modes on their first attempt.
  */
 import { Hono, type Context } from "hono";
+import { cors } from "hono/cors";
 import {
   DOMAIN_BUNDLES,
   GLOBAL_CALIBRATE_LIMIT_PER_HOUR,
   consumeRateLimit,
+  currentWindow,
   evaluateCalibration,
   globalCapacityReached,
+  hashClientIp,
   reserveGlobalSlot,
+  resolveEvaluateUrl,
   secondsUntilNextHour,
 } from "./calibrate";
 import { renderConsole } from "./console";
 import { INVALID_RECEIPT_CODE, INVALID_RECEIPT_MESSAGE, verifyExemplarReceipt } from "./receipt";
+import { SKILL_MD } from "./skill";
 import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
 import {
   MAX_BODY_BYTES,
@@ -31,20 +36,53 @@ import {
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
+const MAX_OFFSET = 10_000;
 const COMMUNITY_TIER = "community";
 
-const INSERT_SQL =
+/**
+ * Insert a new lesson, or refresh the receipt of an existing one with the same
+ * (domain, tool_name, task_fingerprint, violation_rule) invariant
+ * (idx_exemplars_task_invariant, migration 0004).
+ *
+ * This is an UPSERT (ON CONFLICT ... DO UPDATE), not INSERT OR REPLACE.
+ * REPLACE resolves a conflict by deleting the old row, which silently bypasses
+ * the append-only trigger from migration 0003 and changes the row's id. The
+ * upsert keeps the original row and id and only swaps the receipt columns.
+ * A duplicate exemplar_id still raises UNIQUE on the primary key (409).
+ */
+const UPSERT_SQL =
   "INSERT INTO exemplars (id, domain, task_fingerprint, task_description, tool_name, violation_rule, " +
   "primary_statutory_anchor, steering_directive, failed_arguments_json, repaired_arguments_json, " +
-  "receipt_id, tier, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  "receipt_id, tier, created_at, signature, canonical_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+  "ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule) DO UPDATE SET " +
+  "receipt_id = excluded.receipt_id, signature = excluded.signature, canonical_payload = excluded.canonical_payload " +
+  "RETURNING id";
 
 type AppContext = Context<{ Bindings: Env }>;
 
 const app = new Hono<{ Bindings: Env }>();
 
-function bindExemplar(db: D1Database, sql: string, exemplar: CorrectionExemplarInput): D1PreparedStatement {
+// Public API: any origin may read. Writes still require a bearer token, which
+// browsers never attach automatically, so a wildcard origin adds no CSRF risk.
+app.use(
+  "/api/v1/*",
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization", "Accept"],
+    exposeHeaders: ["RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset", "Retry-After"],
+    maxAge: 86400,
+  }),
+);
+
+interface VerifiedReceiptFields {
+  signature: string;
+  canonicalPayload: string;
+}
+
+function bindExemplar(db: D1Database, exemplar: CorrectionExemplarInput, receipt: VerifiedReceiptFields): D1PreparedStatement {
   return db
-    .prepare(sql)
+    .prepare(UPSERT_SQL)
     .bind(
       exemplar.exemplar_id,
       exemplar.domain,
@@ -59,7 +97,29 @@ function bindExemplar(db: D1Database, sql: string, exemplar: CorrectionExemplarI
       exemplar.receipt_id,
       COMMUNITY_TIER,
       exemplar.created_at,
+      receipt.signature,
+      receipt.canonicalPayload,
     );
+}
+
+/**
+ * Record a domain query that found nothing. One row per client, domain, tool,
+ * and query per UTC hour (deterministic id + INSERT OR IGNORE), so repeated
+ * polling does not grow the table. Errors are logged, never surfaced.
+ */
+async function logDemand(db: D1Database, ip: string, domain: string, toolName: string | null, query: string | null): Promise<void> {
+  try {
+    const ipHash = await hashClientIp("demand", ip);
+    const id = await hashClientIp("demand-row", `${ipHash}|${domain}|${toolName ?? ""}|${query ?? ""}|${currentWindow()}`);
+    await db
+      .prepare(
+        "INSERT OR IGNORE INTO domain_demand (id, domain, tool_name, query_text, client_ip_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .bind(id, domain, toolName, query, ipHash, new Date().toISOString())
+      .run();
+  } catch (error) {
+    console.error("ramen-forge demand logging failed", error);
+  }
 }
 
 /** Map a D1 row back to foundry's CorrectionExemplar.to_dict() field names. */
@@ -78,6 +138,8 @@ function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
     receipt_id: row.receipt_id,
     created_at: row.created_at,
     tier: row.tier,
+    signature: row.signature ?? null,
+    canonical_payload: row.canonical_payload ?? null,
   };
 }
 
@@ -145,6 +207,14 @@ app.get("/", (c) => {
   return c.html(renderConsole(nonce));
 });
 
+app.get("/skill.md", (c) => {
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  c.header("Cache-Control", "public, max-age=300");
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header("X-Content-Type-Options", "nosniff");
+  return c.body(SKILL_MD);
+});
+
 app.post("/api/v1/exemplars", async (c) => {
   const denied = await authoriseWrite(c);
   if (denied) return denied;
@@ -169,21 +239,48 @@ app.post("/api/v1/exemplars", async (c) => {
     return c.json({ success: false, error: "exemplar rejected", details: result.errors }, 422);
   }
 
+  // One batch = one transaction, so "did the invariant already exist?" and the
+  // upsert see the same state.
+  const value = result.value;
+  let storedId: string;
+  let refreshed: boolean;
   try {
-    await bindExemplar(c.env.DB, INSERT_SQL, result.value).run();
+    const [existing, upserted] = await c.env.DB.batch<{ id: string }>([
+      c.env.DB.prepare(
+        "SELECT id FROM exemplars WHERE domain = ? AND tool_name = ? AND task_fingerprint = ? AND violation_rule = ?",
+      ).bind(value.domain, value.tool_name, value.task_fingerprint, value.violation_reason),
+      bindExemplar(c.env.DB, value, receipt),
+    ]);
+    const row = upserted?.results[0];
+    if (!row) throw new Error("upsert returned no row");
+    storedId = row.id;
+    refreshed = (existing?.results.length ?? 0) > 0;
   } catch (error) {
     if (error instanceof Error && /UNIQUE constraint failed/i.test(error.message)) {
-      return c.json({ success: false, error: `exemplar_id already recorded: ${result.value.exemplar_id}` }, 409);
+      return c.json({ success: false, error: `exemplar_id already recorded: ${value.exemplar_id}` }, 409);
     }
     throw error;
   }
-  return c.json({ success: true, exemplar_id: result.value.exemplar_id }, 201);
+
+  if (refreshed) {
+    // Same invariant already stored: its receipt was refreshed, the lesson text kept.
+    return c.json({ success: true, exemplar_id: storedId, refreshed: true }, 200);
+  }
+  return c.json({ success: true, exemplar_id: storedId }, 201);
 });
 
 app.get("/api/v1/exemplars", async (c) => {
   // Every filter is optional and combined with AND. task_fingerprint gives an
   // exact-task match; q gives a keyword match that works across phrasings.
-  const { domain, tool_name: toolName, task_fingerprint: taskFingerprint, q, limit: rawLimit } = c.req.query();
+  const {
+    domain,
+    tool_name: toolName,
+    task_fingerprint: taskFingerprint,
+    q,
+    limit: rawLimit,
+    offset: rawOffset,
+  } = c.req.query();
+  let searchTerm: string | null = null;
   const errors: string[] = [];
   const where: string[] = [];
   const params: (string | number)[] = [];
@@ -211,6 +308,7 @@ app.get("/api/v1/exemplars", async (c) => {
       errors.push(search.error);
     } else {
       // SQLite LIKE is case-insensitive for ASCII. Wildcards in q are escaped.
+      searchTerm = search.term;
       const pattern = toLikePattern(search.term);
       where.push(
         "(task_description LIKE ? ESCAPE '\\' OR violation_rule LIKE ? ESCAPE '\\' OR steering_directive LIKE ? ESCAPE '\\')",
@@ -226,6 +324,13 @@ app.get("/api/v1/exemplars", async (c) => {
       errors.push(`limit must be an integer between 1 and ${MAX_LIMIT}`);
     }
   }
+  let offset = 0;
+  if (rawOffset !== undefined) {
+    offset = Number(rawOffset);
+    if (!/^\d+$/.test(rawOffset) || offset > MAX_OFFSET) {
+      errors.push(`offset must be an integer between 0 and ${MAX_OFFSET}`);
+    }
+  }
   if (errors.length > 0) {
     return c.json({ success: false, error: "invalid query", details: errors }, 400);
   }
@@ -233,13 +338,19 @@ app.get("/api/v1/exemplars", async (c) => {
   const sql =
     "SELECT * FROM exemplars" +
     (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
-    " ORDER BY created_at DESC, rowid DESC LIMIT ?";
+    " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?";
   const { results } = await c.env.DB.prepare(sql)
-    .bind(...params, limit)
+    .bind(...params, limit, offset)
     .all<ExemplarRow>();
 
+  // A first-page miss on a domain is unmet demand. Paging past the end is not.
+  if (results.length === 0 && domain !== undefined && offset === 0) {
+    const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+    c.executionCtx.waitUntil(logDemand(c.env.DB, ip, domain, toolName ?? null, searchTerm));
+  }
+
   const exemplars = results.map(toRecord);
-  return c.json({ success: true, count: exemplars.length, exemplars });
+  return c.json({ success: true, count: exemplars.length, limit, offset, exemplars });
 });
 
 app.get("/api/v1/stats", async (c) => {
@@ -283,6 +394,13 @@ app.post("/api/v1/calibrate", async (c) => {
   if (!apiKey) {
     return c.json({ success: false, error: "calibration disabled: RAMEN_API_KEY is not configured" }, 503);
   }
+  let evaluateUrl: string;
+  try {
+    evaluateUrl = resolveEvaluateUrl(c.env.RAMEN_GATEWAY_URL);
+  } catch (error) {
+    console.error("ramen-forge invalid RAMEN_GATEWAY_URL", error);
+    return c.json({ success: false, error: "calibration disabled: RAMEN_GATEWAY_URL is misconfigured" }, 503);
+  }
 
   // Global ceiling first: fail fast without charging the caller's per-IP quota.
   if (await globalCapacityReached(c.env.DB)) return communityCapacityReached(c);
@@ -320,7 +438,7 @@ app.post("/api/v1/calibrate", async (c) => {
   // Atomic reservation closes the race between the pre-check and the upstream call.
   if (!(await reserveGlobalSlot(c.env.DB))) return communityCapacityReached(c);
 
-  const outcome = await evaluateCalibration(apiKey, request.value, bundleId);
+  const outcome = await evaluateCalibration(apiKey, request.value, bundleId, evaluateUrl);
   if (!outcome.ok) {
     return c.json(
       { success: false, error: outcome.error, ...(outcome.upstream_status ? { upstream_status: outcome.upstream_status } : {}) },

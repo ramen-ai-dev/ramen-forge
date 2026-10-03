@@ -5,6 +5,11 @@ export interface Env {
   FORGE_WRITE_TOKEN?: string;
   /** Enterprise ramen-ai API key used by the community calibration proxy. */
   RAMEN_API_KEY?: string;
+  /**
+   * Base URL of the ramen-ai gateway for /calibrate (default https://api.ramenai.dev).
+   * Needed on forge.ramenai.dev, where same-zone subrequests to api.ramenai.dev fail with 522.
+   */
+  RAMEN_GATEWAY_URL?: string;
 }
 
 /** Validated body of POST /api/v1/calibrate. */
@@ -45,6 +50,10 @@ export interface CorrectionExemplarInput {
 /** Exemplar as served back to agents. */
 export interface CorrectionExemplarRecord extends CorrectionExemplarInput {
   tier: MemoryTier;
+  /** Ed25519 signature (base64url) over canonical_payload, for offline verification. */
+  signature: string | null;
+  /** Exact Schema V5 string signed by ramen-ai. */
+  canonical_payload: string | null;
 }
 
 /** Row shape of the `exemplars` D1 table. */
@@ -62,4 +71,6 @@ export interface ExemplarRow {
   receipt_id: string | null;
   tier: MemoryTier;
   created_at: string;
+  signature: string | null;
+  canonical_payload: string | null;
 }

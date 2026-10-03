@@ -7,6 +7,11 @@ account_id = "bfbf0f57606c0dfd9fb36bef616d9158"
 [observability]
 enabled = true
 
+[vars]
+# /calibrate upstream. On forge.ramenai.dev, subrequests to api.ramenai.dev (same zone)
+# fail with 522, so route to the gateway Worker's workers.dev hostname instead.
+RAMEN_GATEWAY_URL = "https://ramen-gateway-worker.ramenai.workers.dev"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "ramen-forge-db"

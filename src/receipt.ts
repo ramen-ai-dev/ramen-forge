@@ -41,7 +41,9 @@ const ALLOWED_RECEIPT_KEYS = new Set([
   "attestation",
 ]);
 
-export type ReceiptCheck = { ok: true; receiptId: string } | { ok: false; reason: string };
+export type ReceiptCheck =
+  | { ok: true; receiptId: string; signature: string; canonicalPayload: string }
+  | { ok: false; reason: string };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -118,5 +120,6 @@ export async function verifyExemplarReceipt(receipt: unknown): Promise<ReceiptCh
     return { ok: false, reason: "receipt.verdict does not match the signed verdict" };
   }
 
-  return { ok: true, receiptId: id.toLowerCase() };
+  // Returned verbatim: these are the exact verified bytes, stored for offline audit.
+  return { ok: true, receiptId: id.toLowerCase(), signature, canonicalPayload: canonical };
 }
