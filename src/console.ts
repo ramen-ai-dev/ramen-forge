@@ -10,7 +10,7 @@ export function renderConsole(nonce: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RAMEN FORGE · The Moral Memory Engine</title>
+<title>ramen forge · The Moral Memory Engine</title>
 <meta name="description" content="Every agent needs a MOM. Agents forget. MOM remembers.">
 <link rel="icon" href="data:,">
 <script nonce="${nonce}" src="https://cdn.tailwindcss.com"></script>
@@ -20,7 +20,7 @@ export function renderConsole(nonce: string): string {
 <header class="border-b border-zinc-800">
   <div class="max-w-6xl mx-auto px-6 py-8">
     <h1 class="text-3xl font-semibold tracking-tight">
-      <span class="text-amber-400">RAMEN FORGE:</span> The Moral Memory Engine
+      <span class="text-amber-400">ramen forge:</span> The Moral Memory Engine
     </h1>
     <p class="mt-2 text-lg text-zinc-300">Every agent needs a MOM. <span class="text-zinc-400">Agents forget.</span> <span class="text-amber-300 font-medium">MOM remembers.</span></p>
   </div>

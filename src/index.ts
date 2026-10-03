@@ -140,6 +140,20 @@ function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
     tier: row.tier,
     signature: row.signature ?? null,
     canonical_payload: row.canonical_payload ?? null,
+    id: row.id,
+    violation_rule: row.violation_rule,
+    times_applied: row.times_applied ?? 0,
+    successful_applications: row.successful_applications ?? 0,
+  };
+}
+
+/** Row as stored, with the two JSON-text columns replaced by parsed objects. */
+function toLookupRecord(row: ExemplarRow): Record<string, unknown> {
+  const { failed_arguments_json: failedJson, repaired_arguments_json: repairedJson, ...rest } = row;
+  return {
+    ...rest,
+    failed_arguments: parseStoredObject(failedJson),
+    repaired_arguments: parseStoredObject(repairedJson),
   };
 }
 
@@ -351,6 +365,58 @@ app.get("/api/v1/exemplars", async (c) => {
 
   const exemplars = results.map(toRecord);
   return c.json({ success: true, count: exemplars.length, limit, offset, exemplars });
+});
+
+const MAX_FEEDBACK_BODY_BYTES = 1024;
+
+app.get("/api/v1/exemplars/:id", async (c) => {
+  const id = c.req.param("id");
+  if (!QUERY_PATTERNS.UUID_RE.test(id)) {
+    // A non-UUID can never match a stored id; answer as not found rather than hit D1.
+    return c.json({ success: false, error: "Exemplar not found" }, 404);
+  }
+  const row = await c.env.DB.prepare("SELECT * FROM exemplars WHERE id = ?1").bind(id).first<ExemplarRow>();
+  if (!row) return c.json({ success: false, error: "Exemplar not found" }, 404);
+  return c.json({ success: true, exemplar: toLookupRecord(row) });
+});
+
+app.post("/api/v1/exemplars/:id/feedback", async (c) => {
+  const id = c.req.param("id");
+  if (!QUERY_PATTERNS.UUID_RE.test(id)) {
+    return c.json({ success: false, error: "Exemplar not found" }, 404);
+  }
+  const parsed = await readJsonBody(c, MAX_FEEDBACK_BODY_BYTES);
+  if (!parsed.ok) return parsed.response;
+
+  const body = parsed.body;
+  const outcome =
+    typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>).success : undefined;
+  if (typeof outcome !== "boolean") {
+    return c.json({ success: false, error: 'body must be JSON of the form {"success": true|false}' }, 400);
+  }
+
+  // Bind 1/0 rather than a boolean: D1 binds numbers, and SQLite has no boolean type.
+  const result = await c.env.DB.prepare(
+    "UPDATE exemplars SET times_applied = times_applied + 1, " +
+      "successful_applications = successful_applications + (CASE WHEN ?1 THEN 1 ELSE 0 END) WHERE id = ?2",
+  )
+    .bind(outcome ? 1 : 0, id)
+    .run();
+  if (result.meta.changes === 0) return c.json({ success: false, error: "Exemplar not found" }, 404);
+  return c.json({ success: true, id, recorded: true });
+});
+
+app.get("/api/v1/domains", async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT domain, COUNT(*) AS lesson_count, GROUP_CONCAT(DISTINCT tool_name) AS tools_csv " +
+      "FROM exemplars GROUP BY domain ORDER BY domain",
+  ).all<{ domain: string; lesson_count: number; tools_csv: string | null }>();
+  const domains = results.map((r) => ({
+    domain: r.domain,
+    lesson_count: Number(r.lesson_count),
+    tools: r.tools_csv ? r.tools_csv.split(",").sort() : [],
+  }));
+  return c.json({ success: true, domains });
 });
 
 app.get("/api/v1/stats", async (c) => {

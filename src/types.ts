@@ -54,6 +54,12 @@ export interface CorrectionExemplarRecord extends CorrectionExemplarInput {
   signature: string | null;
   /** Exact Schema V5 string signed by ramen-ai. */
   canonical_payload: string | null;
+  /** Storage-name aliases of exemplar_id / violation_reason, so list and by-id reads share field names. */
+  id: string;
+  violation_rule: string;
+  /** Community-reported outcomes (POST /api/v1/exemplars/:id/feedback). */
+  times_applied: number;
+  successful_applications: number;
 }
 
 /** Row shape of the `exemplars` D1 table. */
@@ -73,4 +79,6 @@ export interface ExemplarRow {
   created_at: string;
   signature: string | null;
   canonical_payload: string | null;
+  times_applied: number;
+  successful_applications: number;
 }

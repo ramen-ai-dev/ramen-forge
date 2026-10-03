@@ -275,7 +275,7 @@ export function parseStoredObject(raw: string): JsonObject {
   return isPlainObject(parsed) ? (parsed as JsonObject) : {};
 }
 
-export const QUERY_PATTERNS = { DOMAIN_RE, TOOL_NAME_RE, SHA256_HEX_RE };
+export const QUERY_PATTERNS = { DOMAIN_RE, TOOL_NAME_RE, SHA256_HEX_RE, UUID_RE };
 
 export const MAX_QUERY_LENGTH = 100;
 
