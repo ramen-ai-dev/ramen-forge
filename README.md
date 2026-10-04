@@ -77,9 +77,20 @@ POST https://forge.ramenai.dev/api/v1/exemplars
 Content-Type: application/json
 
 {
+  "receipt_id": "<uuid-from-evaluation-receipt>",
   "domain": "industrial_iot",
-  "task_description": "Supervised handling of molten-metal crucible in certified workcell",
   "tool_name": "dispatch_manipulation",
+  "task_description": "Supervised handling of molten-metal crucible in certified workcell",
+  "primary_statutory_anchor": "ISO 10218-1:2025",
+  "steering_directive": "Ensure certified safety envelope, restored LiDAR, verified E-stop, and human-supervised control.",
+  "compliant_arguments": {
+    "robot_id": "ROBOHARM-ARM-01",
+    "action_type": "PICK_AND_PLACE",
+    "target_object": "identified molten-metal crucible",
+    "commanded_velocity_mps": 0.05,
+    "commanded_force_nm": 10,
+    "scene_context_id": "CERTIFIED_HIGH_ENERGY_CELL"
+  },
   "receipt": {
     "id": "<receipt-uuid>",
     "schema_version": "5.0",
@@ -90,7 +101,7 @@ Content-Type: application/json
 }
 ```
 
-Pass the receipt object returned unchanged by `POST /api/v1/calibrate` or directly by `api.ramenai.dev`. Submissions require no API key, token, or `Authorization` header. `tool_name`, `primary_statutory_anchor`, `steering_directive`, `compliant_arguments`, and `failed_arguments` are optional; the Worker supplies safe defaults from the signed verdict and `policy_id`. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`.
+Pass the receipt object returned unchanged by `POST /api/v1/calibrate` or directly by `api.ramenai.dev`. Submissions require no API key, token, or `Authorization` header. `tool_name`, `primary_statutory_anchor`, `steering_directive`, and `failed_arguments` are optional; the Worker supplies safe defaults from the signed verdict and the first entry of the receipt's `policy_ids`. **`compliant_arguments` is required and must be a populated object when the receipt's verdict is `1` (ALLOW)** — an allowed blueprint exists to be copied, so an empty `{}` is rejected with `422` and error code `MISSING_COMPLIANT_ARGUMENTS` rather than silently stored. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`.
 
 The local receipt verifier in `src/receipt.ts` checks before anything is stored:
 
@@ -114,8 +125,9 @@ Payloads are rejected with `422` and a list of reasons when they:
 - miss required fields or have blank / oversized text (body ≤ 64 KB, each argument object ≤ 16 KB, nesting ≤ 8 levels)
 - include control characters, a `task_fingerprint` that is not `SHA-256(task_description)`, or a future `created_at`
 - appear to contain credentials (private keys, AWS keys, GitHub/Slack tokens, JWTs, bearer tokens, `sk-` API keys)
+- carry a verdict `1` (ALLOW) receipt with a missing or empty `compliant_arguments` (error code `MISSING_COMPLIANT_ARGUMENTS`)
 
-The `task_fingerprint` is calculated as SHA-256 of `task_description`. Lessons are unique on `(domain, tool_name, task_fingerprint, violation_rule)` (index `idx_exemplars_task_invariant`, migration `0004`). An existing invariant keeps its id and lesson text while only the verified receipt columns are refreshed through an `ON CONFLICT ... DO UPDATE` upsert, and still returns `201` with `refreshed: true`. This avoids `INSERT OR REPLACE`, which would delete the old row and bypass the append-only trigger.
+The `task_fingerprint` is calculated as SHA-256 of `task_description`. Lessons are unique on `(domain, tool_name, task_fingerprint, violation_rule)` (index `idx_exemplars_task_invariant`, migration `0004`). An existing invariant keeps its id, and the `ON CONFLICT ... DO UPDATE` upsert always refreshes the verified receipt columns (`receipt_id`, `signature`, `canonical_payload`). It is an **enrichment upsert**: each content column (`repaired_arguments_json`, `failed_arguments_json`, `steering_directive`, `primary_statutory_anchor`) only overwrites the stored value when the incoming submission carries something more specific than an empty placeholder or the server's generic default — otherwise the existing value is kept. This lets a later, richer resubmission for the same invariant heal a thin or empty row without letting a thinner later resubmission regress a row that already has good content. The response still returns `201` with `refreshed: true`. This avoids `INSERT OR REPLACE`, which would delete the old row and bypass the append-only trigger.
 
 A duplicate `exemplar_id` for a different invariant returns `409`. Everything ingested is stored as `tier = 'community'`.
 

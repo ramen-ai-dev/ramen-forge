@@ -41,14 +41,24 @@ const MAX_OFFSET = 10_000;
 const COMMUNITY_TIER = "community";
 
 /**
- * Insert a new lesson, or refresh the receipt of an existing one with the same
+ * Insert a new lesson, or enrich an existing one with the same
  * (domain, tool_name, task_fingerprint, violation_rule) invariant
  * (idx_exemplars_task_invariant, migration 0004).
  *
  * This is an UPSERT (ON CONFLICT ... DO UPDATE), not INSERT OR REPLACE.
  * REPLACE resolves a conflict by deleting the old row, which silently bypasses
  * the append-only trigger from migration 0003 and changes the row's id. The
- * upsert keeps the original row and id and only swaps the receipt columns.
+ * upsert keeps the original row and id.
+ *
+ * The receipt columns (receipt_id, signature, canonical_payload) always refresh
+ * to the incoming receipt. The content columns (arguments, steering text, anchor)
+ * only overwrite the stored value when the incoming one is more informative than
+ * both an empty placeholder and the server's own generic default, otherwise the
+ * existing value is kept. This lets a later, richer resubmission for the same
+ * invariant heal a thin or empty row (e.g. a submission that initially omitted
+ * compliant_arguments) without letting a later thin resubmission regress a row
+ * that already has good content.
+ *
  * A duplicate exemplar_id still raises UNIQUE on the primary key (409).
  */
 const UPSERT_SQL =
@@ -56,7 +66,24 @@ const UPSERT_SQL =
   "primary_statutory_anchor, steering_directive, failed_arguments_json, repaired_arguments_json, " +
   "receipt_id, tier, created_at, signature, canonical_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
   "ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule) DO UPDATE SET " +
-  "receipt_id = excluded.receipt_id, signature = excluded.signature, canonical_payload = excluded.canonical_payload " +
+  "receipt_id = excluded.receipt_id, " +
+  "signature = excluded.signature, " +
+  "canonical_payload = excluded.canonical_payload, " +
+  "repaired_arguments_json = CASE " +
+  "WHEN excluded.repaired_arguments_json IS NOT NULL AND excluded.repaired_arguments_json != '{}' " +
+  "THEN excluded.repaired_arguments_json ELSE exemplars.repaired_arguments_json END, " +
+  "failed_arguments_json = CASE " +
+  "WHEN excluded.failed_arguments_json IS NOT NULL AND excluded.failed_arguments_json != '{}' " +
+  "THEN excluded.failed_arguments_json ELSE exemplars.failed_arguments_json END, " +
+  "steering_directive = CASE " +
+  "WHEN excluded.steering_directive IS NOT NULL AND excluded.steering_directive != '' " +
+  "AND excluded.steering_directive != 'Compliant operational blueprint' " +
+  "THEN excluded.steering_directive ELSE exemplars.steering_directive END, " +
+  "primary_statutory_anchor = CASE " +
+  "WHEN excluded.primary_statutory_anchor IS NOT NULL AND excluded.primary_statutory_anchor != '' " +
+  "AND excluded.primary_statutory_anchor != 'Policy unknown' " +
+  "AND excluded.primary_statutory_anchor NOT LIKE 'Statutory Invariant (Policy unknown)' " +
+  "THEN excluded.primary_statutory_anchor ELSE exemplars.primary_statutory_anchor END " +
   "RETURNING id";
 
 type AppContext = Context<{ Bindings: Env }>;
@@ -185,6 +212,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** First non-blank string in a signed-payload array field, or null. */
+function firstPolicyId(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const first = value.find((item): item is string => typeof item === "string" && item.trim() !== "");
+  return first ? first.trim() : null;
+}
+
 function receiptMetadata(receipt: Awaited<ReturnType<typeof verifyExemplarReceipt>>): {
   policyId: string;
   violationReason: string;
@@ -192,7 +226,12 @@ function receiptMetadata(receipt: Awaited<ReturnType<typeof verifyExemplarReceip
   steeringDirective: string;
 } {
   const signedPayload = receipt.ok ? receipt.signedPayload : {};
-  const policyId = typeof signedPayload.policy_id === "string" && signedPayload.policy_id.trim() !== "" ? signedPayload.policy_id : "unknown";
+  // Schema V5 signs a plural `policy_ids` array; `policy_id` (singular) is kept as a fallback
+  // for older or non-standard payloads. Without this, multi-policy receipts (the common case)
+  // always fell through to the literal "unknown".
+  const policyId =
+    firstPolicyId(signedPayload.policy_ids) ??
+    (typeof signedPayload.policy_id === "string" && signedPayload.policy_id.trim() !== "" ? signedPayload.policy_id : "unknown");
   const allowed = receipt.ok && receipt.verdict === 1;
   return {
     policyId,
@@ -256,6 +295,27 @@ app.post("/api/v1/exemplars", async (c) => {
   const metadata = receiptMetadata(receipt);
   const request = isPlainObject(body) ? body : {};
   const signedVerdict = receipt.verdict;
+
+  // Allowed blueprints (verdict=1) exist to be copied: an empty compliant_arguments
+  // dictionary stores a lesson with nothing to apply. Require it populated up front,
+  // before the generic validator (which treats {} as a structurally valid object).
+  if (signedVerdict === 1) {
+    const submittedArguments = request.compliant_arguments ?? request.repaired_arguments;
+    const populated = isPlainObject(submittedArguments) && Object.keys(submittedArguments).length > 0;
+    if (!populated) {
+      return c.json(
+        {
+          success: false,
+          error: {
+            code: "MISSING_COMPLIANT_ARGUMENTS",
+            message: "Exemplar rejected: Allowed blueprints (verdict=1) must provide a populated compliant_arguments dictionary.",
+          },
+        },
+        422,
+      );
+    }
+  }
+
   const exemplarBody = {
     exemplar_id: receipt.receiptId,
     domain: request.domain,

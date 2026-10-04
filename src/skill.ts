@@ -93,18 +93,29 @@ When multiple exemplars return for a tool, prioritize the newest record (created
 
 Submissions require no API keys, tokens, or Authorization headers. The complete Schema V5 receipt returned by POST /api/v1/calibrate (or directly by api.ramenai.dev) is the admission credential. ramen forge verifies the Ed25519 signature at the Cloudflare edge with ramen_pk_v1 and records the verified lesson locally; no ledger lookup is performed.
 
-Submit the receipt object together with the lesson classification context:
+Submit the receipt object together with the lesson classification context. For an ALLOW (\`verdict: 1\`) receipt, \`compliant_arguments\` is **required and must be a populated object**: it is the whole point of an allowed blueprint, and an empty \`{}\` is rejected with \`422 MISSING_COMPLIANT_ARGUMENTS\`. Always include \`primary_statutory_anchor\` and \`steering_directive\` too so the stored lesson carries the specific rule and recovery instruction instead of a generic placeholder:
 
 \`\`\`http
 POST https://forge.ramenai.dev/api/v1/exemplars
 Content-Type: application/json
 
 {
+  "receipt_id": "<uuid-from-evaluation-receipt>",
   "domain": "industrial_iot",
-  "task_description": "Supervised handling of molten-metal crucible in certified workcell",
   "tool_name": "dispatch_manipulation",
+  "task_description": "Supervised handling of molten-metal crucible in certified workcell",
+  "primary_statutory_anchor": "ISO 10218-1:2025",
+  "steering_directive": "Ensure certified safety envelope, restored LiDAR, verified E-stop, and human-supervised control.",
+  "compliant_arguments": {
+    "robot_id": "ROBOHARM-ARM-01",
+    "action_type": "PICK_AND_PLACE",
+    "target_object": "identified molten-metal crucible",
+    "commanded_velocity_mps": 0.05,
+    "commanded_force_nm": 10,
+    "scene_context_id": "CERTIFIED_HIGH_ENERGY_CELL"
+  },
   "receipt": {
-    "id": "<receipt-uuid>",
+    "id": "<uuid-from-evaluation-receipt>",
     "schema_version": "5.0",
     "kid": "ramen_pk_v1",
     "canonical_payload": "...",
@@ -113,6 +124,8 @@ Content-Type: application/json
 }
 \`\`\`
 The agent should pass the receipt object returned by POST /api/v1/calibrate (or api.ramenai.dev) unchanged. The forge verifies the signature over canonical_payload locally, extracts the signed verdict and policy metadata, and commits the lesson to D1. Submissions are limited to 30 per hour per client IP and return 429 when that quota is exhausted. A successful ingestion returns 201 Created with the receipt id and signed verdict.
+
+Resubmitting the same receipt id for the same (domain, tool_name, task_fingerprint, violation_rule) invariant enriches the stored row in place: any field in this new submission that carries real content (a non-empty \`compliant_arguments\`/\`failed_arguments\`, or a specific \`steering_directive\`/\`primary_statutory_anchor\` rather than the generic default) overwrites the previously stored placeholder. A field already populated with real content is never regressed back to a placeholder by a later, thinner resubmission.
 
 ### Verdict semantics
 
