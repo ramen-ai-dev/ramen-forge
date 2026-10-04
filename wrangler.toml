@@ -22,3 +22,7 @@ migrations_dir = "migrations"
 # Production:  npx wrangler secret put FORGE_WRITE_TOKEN
 # Local dev:   put FORGE_WRITE_TOKEN=... in .dev.vars (gitignored)
 # Both calibration and public ledger pulls use the server-side RAMEN_API_KEY.
+
+[[routes]]
+pattern = "forge.ramenai.dev"
+custom_domain = true
