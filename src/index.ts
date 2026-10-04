@@ -6,6 +6,7 @@
  * back so agents can avoid known failure modes on their first attempt.
  */
 import { Hono, type Context } from "hono";
+import { verifyReceipt, type RamenReceipt } from "@ramen-ai/node-core";
 import { cors } from "hono/cors";
 import {
   DOMAIN_BUNDLES,
@@ -22,7 +23,7 @@ import {
 import { renderConsole } from "./console";
 import { INVALID_RECEIPT_CODE, INVALID_RECEIPT_MESSAGE, verifyExemplarReceipt } from "./receipt";
 import { SKILL_MD } from "./skill";
-import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
+import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow, JsonObject } from "./types";
 import {
   MAX_BODY_BYTES,
   MAX_CALIBRATE_BODY_BYTES,
@@ -201,6 +202,204 @@ async function readJsonBody(
   }
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstText(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+  }
+  return null;
+}
+
+function evaluationText(record: Record<string, unknown>, keys: string[]): string | null {
+  const direct = firstText(record, keys);
+  if (direct) return direct;
+  for (const key of ["total_violations", "violations", "results"]) {
+    const entries = record[key];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (isPlainObject(entry)) {
+        const nested = firstText(entry, keys);
+        if (nested) return nested;
+        const violations = entry.violations;
+        if (Array.isArray(violations)) {
+          for (const violation of violations) {
+            if (isPlainObject(violation)) {
+              const violationText = firstText(violation, keys);
+              if (violationText) return violationText;
+            }
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function statutoryAnchor(record: Record<string, unknown>, receipt: Record<string, unknown>): string {
+  const direct = firstText(record, ["primary_statutory_anchor"]);
+  if (direct) return direct;
+  for (const value of [record.statutory_anchors, receipt.statutory_anchors]) {
+    if (Array.isArray(value)) {
+      const anchor = value.find((item): item is string => typeof item === "string" && item.trim() !== "");
+      if (anchor) return anchor.trim();
+    }
+  }
+  return "ramen ai statutory policy invariant";
+}
+
+function receiptCandidate(value: unknown): Record<string, unknown> | null {
+  if (!isPlainObject(value)) return null;
+  if (isPlainObject(value.receipt)) return value.receipt;
+  if (isPlainObject(value.ledger_receipt)) return value.ledger_receipt;
+  const receipt: Record<string, unknown> = {};
+  for (const key of ["id", "schema_version", "kid", "signature", "canonical_payload", "verdict", "statutory_anchors", "attestation"]) {
+    if (key in value) receipt[key] = value[key];
+  }
+  return Object.keys(receipt).length > 0 ? receipt : null;
+}
+
+function evaluatedInput(value: Record<string, unknown>): string | null {
+  for (const key of ["evaluated_input", "evaluatedInput", "input"]) {
+    if (typeof value[key] === "string" && value[key].trim() !== "") return value[key] as string;
+  }
+  return null;
+}
+
+function parseEvaluatedCall(input: string): { tool: string; arguments: JsonObject } | null {
+  try {
+    const parsed = JSON.parse(input);
+    if (!isPlainObject(parsed) || typeof parsed.tool !== "string" || !isPlainObject(parsed.arguments)) return null;
+    return { tool: parsed.tool, arguments: parsed.arguments as JsonObject };
+  } catch {
+    return null;
+  }
+}
+
+function resolveLedgerReceiptUrl(gatewayUrl: string | undefined, receiptId: string): string {
+  const raw = gatewayUrl?.trim() || "https://api.ramenai.dev";
+  const url = new URL(raw);
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new Error("RAMEN_GATEWAY_URL must be a plain https origin");
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}/api/v1/receipts/${encodeURIComponent(receiptId)}`;
+}
+
+const LEDGER_RECEIPT_ERROR = {
+  code: INVALID_RECEIPT_CODE,
+  message: "Receipt ID could not be found or verified on the authoritative ramen ai ledger.",
+} as const;
+
+async function pullLedgerExemplar(
+  c: AppContext,
+  request: Record<string, unknown>,
+): Promise<{ ok: true; body: Record<string, unknown>; receipt: Awaited<ReturnType<typeof verifyExemplarReceipt>> } | { ok: false }> {
+  const receiptId = request.receipt_id;
+  const domain = request.domain;
+  const unknownKeys = Object.keys(request).filter((key) => !["receipt_id", "domain", "task_description"].includes(key));
+  if (unknownKeys.length > 0) return { ok: false };
+  if (typeof receiptId !== "string" || !QUERY_PATTERNS.UUID_RE.test(receiptId)) return { ok: false };
+  if (typeof domain !== "string" || !QUERY_PATTERNS.DOMAIN_RE.test(domain)) return { ok: false };
+  if ("task_description" in request && typeof request.task_description !== "string") return { ok: false };
+
+  let url: string;
+  try {
+    url = resolveLedgerReceiptUrl(c.env.RAMEN_GATEWAY_URL, receiptId);
+  } catch (error) {
+    console.error("ramen-forge invalid ledger gateway URL", error);
+    return { ok: false };
+  }
+  if (!c.env.RAMEN_API_KEY) {
+    console.error("ramen-forge ledger pull unavailable: RAMEN_API_KEY is not configured");
+    return { ok: false };
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(url, {
+      headers: { Authorization: `Bearer ${c.env.RAMEN_API_KEY}`, "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (error) {
+    console.error("ramen-forge ledger pull failed", error);
+    return { ok: false };
+  }
+  if (!upstream.ok) {
+    console.error("ramen-forge ledger pull upstream status", upstream.status);
+    return { ok: false };
+  }
+
+  let upstreamBody: unknown;
+  try {
+    upstreamBody = await upstream.json();
+  } catch (error) {
+    console.error("ramen-forge ledger pull returned invalid JSON", error);
+    return { ok: false };
+  }
+  if (!isPlainObject(upstreamBody)) return { ok: false };
+  const envelope = isPlainObject(upstreamBody.data) ? { ...upstreamBody, ...upstreamBody.data } : upstreamBody;
+  const authoritativeReceipt = receiptCandidate(envelope);
+  const input = evaluatedInput(envelope);
+  if (!authoritativeReceipt || !input) return { ok: false };
+
+  const receipt = await verifyExemplarReceipt(authoritativeReceipt, { allowBlocked: true });
+  if (!receipt.ok) {
+    console.error("ramen-forge ledger receipt verification failed", receipt.reason);
+    return { ok: false };
+  }
+  if (receipt.receiptId !== receiptId.toLowerCase()) {
+    console.error("ramen-forge ledger receipt id mismatch");
+    return { ok: false };
+  }
+  const authoritativeDomain = firstText(envelope, ["domain"]);
+  if (authoritativeDomain && authoritativeDomain !== domain) {
+    console.error("ramen-forge ledger domain mismatch");
+    return { ok: false };
+  }
+  const payloadBinding = await verifyReceipt(authoritativeReceipt as unknown as RamenReceipt, input);
+  if (!payloadBinding.valid) {
+    console.error("ramen-forge ledger payload binding failed", payloadBinding.reason);
+    return { ok: false };
+  }
+
+  const evaluated = parseEvaluatedCall(input);
+  if (!evaluated || !QUERY_PATTERNS.TOOL_NAME_RE.test(evaluated.tool)) return { ok: false };
+  const allowed = receipt.verdict === 1;
+  const receiptRecord = authoritativeReceipt;
+  const taskDescription =
+    typeof request.task_description === "string" && request.task_description.trim() !== ""
+      ? request.task_description
+      : `Authoritative ledger ${allowed ? "compliant reference" : "blocked policy"} for ${evaluated.tool}`;
+  const violationReason = allowed
+    ? "No violation: compliant reference action"
+    : evaluationText(envelope, ["violation_reason", "reasoning", "reason"]) ?? "Policy invariant breach";
+  const steeringDirective = allowed
+    ? evaluationText(envelope, ["steering_directive", "recovery_instruction", "instruction"]) ?? "Compliant operational blueprint"
+    : evaluationText(envelope, ["steering_directive", "recovery_instruction", "instruction"]) ?? "Policy recovery instruction unavailable";
+  const createdAt = firstText(envelope, ["executed_at", "created_at"]) ?? new Date().toISOString();
+
+  return {
+    ok: true,
+    receipt,
+    body: {
+      exemplar_id: receipt.receiptId,
+      domain,
+      task_description: taskDescription,
+      tool_name: evaluated.tool,
+      failed_arguments: allowed ? {} : evaluated.arguments,
+      violation_reason: violationReason,
+      primary_statutory_anchor: statutoryAnchor(envelope, receiptRecord),
+      steering_directive: steeringDirective,
+      repaired_arguments: allowed ? evaluated.arguments : {},
+      receipt_id: receipt.receiptId,
+      created_at: createdAt,
+    },
+  };
+}
+
 app.get("/", (c) => {
   const nonce = crypto.randomUUID().replace(/-/g, "");
   c.header(
@@ -236,19 +435,36 @@ app.post("/api/v1/exemplars", async (c) => {
   const parsed = await readJsonBody(c);
   if (!parsed.ok) return parsed.response;
 
-  // Receipt first: nothing is validated or stored without an authentic ALLOW receipt.
   const body = parsed.body;
-  const receipt = await verifyExemplarReceipt(
-    typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>).receipt : undefined,
-  );
-  if (!receipt.ok) {
-    return c.json(
-      { success: false, error: { code: INVALID_RECEIPT_CODE, message: INVALID_RECEIPT_MESSAGE }, details: [receipt.reason] },
-      422,
+  let exemplarBody: unknown = body;
+  let receipt: Awaited<ReturnType<typeof verifyExemplarReceipt>>;
+  const isLedgerRequest =
+    isPlainObject(body) &&
+    typeof body.receipt_id === "string" &&
+    body.receipt === undefined &&
+    !("tool_name" in body) &&
+    !("exemplar_id" in body);
+
+  if (isLedgerRequest) {
+    const pulled = await pullLedgerExemplar(c, body as Record<string, unknown>);
+    if (!pulled.ok) return c.json({ success: false, error: LEDGER_RECEIPT_ERROR }, 422);
+    exemplarBody = pulled.body;
+    receipt = pulled.receipt;
+  } else {
+    // Receipt first: nothing is validated or stored without an authentic ALLOW receipt.
+    receipt = await verifyExemplarReceipt(
+      isPlainObject(body) ? body.receipt : undefined,
     );
+    if (!receipt.ok) {
+      return c.json(
+        { success: false, error: { code: INVALID_RECEIPT_CODE, message: INVALID_RECEIPT_MESSAGE }, details: [receipt.reason] },
+        422,
+      );
+    }
   }
 
-  const result = await validateExemplar(body, receipt.receiptId);
+  if (!receipt.ok) return c.json({ success: false, error: LEDGER_RECEIPT_ERROR }, 422);
+  const result = await validateExemplar(exemplarBody, receipt.receiptId);
   if (!result.ok) {
     return c.json({ success: false, error: "exemplar rejected", details: result.errors }, 422);
   }

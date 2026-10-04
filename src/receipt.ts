@@ -41,8 +41,17 @@ const ALLOWED_RECEIPT_KEYS = new Set([
   "attestation",
 ]);
 
+export type ReceiptVerdict = 0 | 1;
+
 export type ReceiptCheck =
-  | { ok: true; receiptId: string; signature: string; canonicalPayload: string }
+  | {
+      ok: true;
+      receiptId: string;
+      signature: string;
+      canonicalPayload: string;
+      verdict: ReceiptVerdict;
+      signedPayload: Record<string, unknown>;
+    }
   | { ok: false; reason: string };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -69,7 +78,10 @@ function ramenPublicKey(): Promise<CryptoKey> {
   return publicKey;
 }
 
-export async function verifyExemplarReceipt(receipt: unknown): Promise<ReceiptCheck> {
+export async function verifyExemplarReceipt(
+  receipt: unknown,
+  options: { allowBlocked?: boolean } = {},
+): Promise<ReceiptCheck> {
   if (receipt === undefined || receipt === null) return { ok: false, reason: "receipt is missing" };
   if (!isPlainObject(receipt)) return { ok: false, reason: "receipt must be a JSON object" };
 
@@ -115,11 +127,21 @@ export async function verifyExemplarReceipt(receipt: unknown): Promise<ReceiptCh
   if (signed.schema_version !== RECEIPT_SCHEMA_VERSION) return { ok: false, reason: "signed schema_version is not 5.0" };
   if (signed.kid !== RECEIPT_KID) return { ok: false, reason: "signed kid does not match ramen_pk_v1" };
   if (signed.id !== id) return { ok: false, reason: "signed id does not match receipt.id" };
-  if (signed.verdict !== VERDICT_ALLOWED) return { ok: false, reason: "signed verdict is not 1 (the evaluated call was blocked)" };
-  if (receipt.verdict !== undefined && receipt.verdict !== signed.verdict) {
+  const signedVerdict = signed.verdict;
+  if (signedVerdict !== VERDICT_ALLOWED && !(options.allowBlocked === true && signedVerdict === 0)) {
+    return { ok: false, reason: "signed verdict is not a supported ALLOW or BLOCK result" };
+  }
+  if (receipt.verdict !== undefined && receipt.verdict !== signedVerdict) {
     return { ok: false, reason: "receipt.verdict does not match the signed verdict" };
   }
 
   // Returned verbatim: these are the exact verified bytes, stored for offline audit.
-  return { ok: true, receiptId: id.toLowerCase(), signature, canonicalPayload: canonical };
+  return {
+    ok: true,
+    receiptId: id.toLowerCase(),
+    signature,
+    canonicalPayload: canonical,
+    verdict: signedVerdict,
+    signedPayload: signed,
+  };
 }

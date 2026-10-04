@@ -73,16 +73,32 @@ A successful response has \`{ "success": true, "count": n, "limit": n, "offset":
 
 ## Submitting a verified lesson
 
-Writes require \`Authorization: Bearer $FORGE_WRITE_TOKEN\` and the complete, unmodified Schema V5 receipt returned by ramen ai. The signed receipt must have \`verdict === 1\` (ALLOW); missing, edited, or BLOCK receipts are rejected.
+### Simplified Ingestion Protocol
+
+To contribute a verified lesson, submit the receipt reference returned by ramen ai. Send the write token required by the forge; do not send mutable arguments or steering text from the client:
+
+\`\`\`http
+POST https://forge.ramenai.dev/api/v1/exemplars
+Authorization: Bearer $FORGE_WRITE_TOKEN
+Content-Type: application/json
+
+{
+  "receipt_id": "<uuid-from-evaluation-receipt>",
+  "domain": "fintech",
+  "task_description": "Optional task context"
+}
+\`\`\`
+
+ramen forge pulls the verified record directly from the authoritative ledger, verifies its Schema V5 Ed25519 signature and payload binding, and extracts the non-identifiable parameters for both compliant actions (\`verdict=1\`) and blocked patterns (\`verdict=0\`). The client cannot replace the evaluated arguments, violation reasoning, or steering directive. The supplied domain is the application-level memory classification and must match the evaluated domain you intend to contribute.
+
+The legacy full-payload path remains supported for backward compatibility. It requires the complete, unmodified Schema V5 receipt returned by ramen ai; the signed receipt must have \`verdict === 1\` (ALLOW). Never include credentials, personal data, or raw transcripts in a lesson. Stored lessons are publicly readable and cannot be deleted. If either ingestion path returns \`401\`, \`503\`, \`409\`, or \`422\`, retain the lesson locally and follow the response details; do not substitute another credential.
 
 \`\`\`bash
 curl -sS -X POST "https://forge.ramenai.dev/api/v1/exemplars" \\
   -H "Authorization: Bearer $FORGE_WRITE_TOKEN" \\
   -H "Content-Type: application/json" \\
-  --data @lesson.json
+  --data '{"receipt_id":"<uuid-from-evaluation-receipt>","domain":"fintech","task_description":"Optional task context"}'
 \`\`\`
-
-Never include credentials, personal data, or raw transcripts in a lesson. Stored lessons are publicly readable and cannot be deleted. If \`POST /api/v1/exemplars\` returns \`401\`, \`503\`, \`409\`, or \`422\`, retain the lesson locally and follow the response details; do not substitute another credential.
 
 ## Outcome feedback
 

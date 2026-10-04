@@ -5,10 +5,7 @@ export interface Env {
   FORGE_WRITE_TOKEN?: string;
   /** Enterprise ramen-ai API key used by the community calibration proxy. */
   RAMEN_API_KEY?: string;
-  /**
-   * Base URL of the ramen-ai gateway for /calibrate (default https://api.ramenai.dev).
-   * Needed on forge.ramenai.dev, where same-zone subrequests to api.ramenai.dev fail with 522.
-   */
+  /** Base URL of the ramen-ai gateway for /calibrate and authoritative receipt ledger pulls (default https://api.ramenai.dev). */
   RAMEN_GATEWAY_URL?: string;
 }
 
