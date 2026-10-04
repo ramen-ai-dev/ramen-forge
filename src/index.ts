@@ -211,11 +211,16 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Only this exact reference schema is eligible for public ledger ingestion. */
+/** Receipt references are public unless client argument fields are present. */
 function isLedgerPullRequest(value: unknown): value is Record<string, unknown> {
-  if (!isPlainObject(value) || !("receipt_id" in value) || !("domain" in value)) return false;
-  const allowedKeys = new Set(["receipt_id", "domain", "task_description"]);
-  return Object.keys(value).every((key) => allowedKeys.has(key));
+  if (!isPlainObject(value)) return false;
+  return Boolean(
+    value.receipt_id &&
+      value.domain &&
+      !value.failed_arguments &&
+      !value.repaired_arguments &&
+      !value.compliant_arguments,
+  );
 }
 
 function firstText(record: Record<string, unknown>, keys: string[]): string | null {
@@ -311,8 +316,6 @@ async function pullLedgerExemplar(
 ): Promise<{ ok: true; body: Record<string, unknown>; receipt: Awaited<ReturnType<typeof verifyExemplarReceipt>> } | { ok: false }> {
   const receiptId = request.receipt_id;
   const domain = request.domain;
-  const unknownKeys = Object.keys(request).filter((key) => !["receipt_id", "domain", "task_description"].includes(key));
-  if (unknownKeys.length > 0) return { ok: false };
   if (typeof receiptId !== "string" || !QUERY_PATTERNS.UUID_RE.test(receiptId)) return { ok: false };
   if (typeof domain !== "string" || !QUERY_PATTERNS.DOMAIN_RE.test(domain)) return { ok: false };
   if ("task_description" in request && typeof request.task_description !== "string") return { ok: false };
@@ -781,4 +784,5 @@ app.onError((error, c) => {
   return c.json({ success: false, error: "internal error" }, 500);
 });
 
+export { app };
 export default app;

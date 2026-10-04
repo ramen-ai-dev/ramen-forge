@@ -151,6 +151,7 @@ export type CalibrateOutcome =
         statutory_anchors: string[];
         violations: { rule_id: string; rule_name: string; reasoning: string | null; recovery_instruction: string | null }[];
         receipt: RamenReceipt | null;
+        receipt_id: string | null;
         receipt_verified: boolean;
         receipt_reason: string | null;
         /** Exact string evaluated; the receipt's payload_hash is SHA-256 of this. */
@@ -232,6 +233,7 @@ export async function evaluateCalibration(
         recovery_instruction: v.recovery_instruction ?? null,
       })),
       receipt,
+      receipt_id: receipt?.id ?? null,
       receipt_verified: receiptVerified,
       receipt_reason: receiptReason,
       evaluated_input: input,
