@@ -11,6 +11,7 @@ import { cors } from "hono/cors";
 import {
   DOMAIN_BUNDLES,
   GLOBAL_CALIBRATE_LIMIT_PER_HOUR,
+  consumeLedgerRateLimit,
   consumeRateLimit,
   currentWindow,
   evaluateCalibration,
@@ -204,6 +205,13 @@ async function readJsonBody(
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Only this exact reference schema is eligible for public ledger ingestion. */
+function isLedgerPullRequest(value: unknown): value is Record<string, unknown> {
+  if (!isPlainObject(value) || !("receipt_id" in value) || !("domain" in value)) return false;
+  const allowedKeys = new Set(["receipt_id", "domain", "task_description"]);
+  return Object.keys(value).every((key) => allowedKeys.has(key));
 }
 
 function firstText(record: Record<string, unknown>, keys: string[]): string | null {
@@ -429,21 +437,30 @@ app.get("/skill.md", (c) => {
 });
 
 app.post("/api/v1/exemplars", async (c) => {
-  const denied = await authoriseWrite(c);
-  if (denied) return denied;
-
+  // The body determines whether this is the public receipt-reference path or
+  // the legacy client-supplied path. Parse before checking authorization.
   const parsed = await readJsonBody(c);
   if (!parsed.ok) return parsed.response;
 
   const body = parsed.body;
+  const isLedgerRequest = isLedgerPullRequest(body);
+  if (isLedgerRequest) {
+    const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+    const rate = await consumeLedgerRateLimit(c.env.DB, ip);
+    c.header("RateLimit-Limit", String(rate.limit));
+    c.header("RateLimit-Remaining", String(rate.remaining));
+    c.header("RateLimit-Reset", String(Math.max(0, Math.ceil(rate.resetAt - Date.now() / 1000))));
+    if (!rate.allowed) {
+      c.header("Retry-After", String(Math.max(1, Math.ceil(rate.resetAt - Date.now() / 1000))));
+      return c.json({ success: false, error: `rate limit exceeded: ${rate.limit} ledger submissions per hour per client` }, 429);
+    }
+  } else {
+    const denied = await authoriseWrite(c);
+    if (denied) return denied;
+  }
+
   let exemplarBody: unknown = body;
   let receipt: Awaited<ReturnType<typeof verifyExemplarReceipt>>;
-  const isLedgerRequest =
-    isPlainObject(body) &&
-    typeof body.receipt_id === "string" &&
-    body.receipt === undefined &&
-    !("tool_name" in body) &&
-    !("exemplar_id" in body);
 
   if (isLedgerRequest) {
     const pulled = await pullLedgerExemplar(c, body as Record<string, unknown>);
@@ -494,7 +511,7 @@ app.post("/api/v1/exemplars", async (c) => {
 
   if (refreshed) {
     // Same invariant already stored: its receipt was refreshed, the lesson text kept.
-    return c.json({ success: true, exemplar_id: storedId, refreshed: true }, 200);
+    return c.json({ success: true, exemplar_id: storedId, refreshed: true }, isLedgerRequest ? 201 : 200);
   }
   return c.json({ success: true, exemplar_id: storedId }, 201);
 });

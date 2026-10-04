@@ -75,11 +75,14 @@ A successful response has \`{ "success": true, "count": n, "limit": n, "offset":
 
 ### Simplified Ingestion Protocol
 
-To contribute a verified lesson, submit the receipt reference returned by ramen ai. Send the write token required by the forge; do not send mutable arguments or steering text from the client:
+#### Zero-Token Ingestion
+
+Contributing a verified lesson through the receipt-reference path requires no authentication token, no API key, and no \`Authorization\` header. The authentic receipt on the authoritative ramen ai ledger is the sole admission credential. ramen forge uses its server-side Enterprise key to retrieve and verify that receipt; never send the key to the Worker.
+
+#### Submission Schema
 
 \`\`\`http
 POST https://forge.ramenai.dev/api/v1/exemplars
-Authorization: Bearer $FORGE_WRITE_TOKEN
 Content-Type: application/json
 
 {
@@ -89,16 +92,21 @@ Content-Type: application/json
 }
 \`\`\`
 
-ramen forge pulls the verified record directly from the authoritative ledger, verifies its Schema V5 Ed25519 signature and payload binding, and extracts the non-identifiable parameters for both compliant actions (\`verdict=1\`) and blocked patterns (\`verdict=0\`). The client cannot replace the evaluated arguments, violation reasoning, or steering directive. The supplied domain is the application-level memory classification and must match the evaluated domain you intend to contribute.
+ramen forge pulls the verified record directly from the authoritative ledger, verifies its Schema V5 Ed25519 signature and payload binding, and extracts the non-identifiable parameters. The client cannot replace the evaluated arguments, violation reasoning, or steering directive. Public ledger submissions are limited to 30 per hour per client IP and return \`429\` when that quota is exhausted.
 
-The legacy full-payload path remains supported for backward compatibility. It requires the complete, unmodified Schema V5 receipt returned by ramen ai; the signed receipt must have \`verdict === 1\` (ALLOW). Never include credentials, personal data, or raw transcripts in a lesson. Stored lessons are publicly readable and cannot be deleted. If either ingestion path returns \`401\`, \`503\`, \`409\`, or \`422\`, retain the lesson locally and follow the response details; do not substitute another credential.
+#### Supported Verdicts
+
+Both signed outcomes are accepted and indexed: \`verdict=0\` stores blocked failure patterns to avoid with the evaluated arguments in \`failed_arguments\`, while \`verdict=1\` stores compliant operational blueprints with the evaluated arguments in \`repaired_arguments\`.
+
+The legacy full-payload path remains supported for backward compatibility. When a client supplies its own arguments, rule, or directive, it must include \`Authorization: Bearer $FORGE_WRITE_TOKEN\`; that path remains ALLOW-only and requires the complete, unmodified Schema V5 receipt. Never include credentials, personal data, or raw transcripts in a lesson. Stored lessons are publicly readable and cannot be deleted.
 
 \`\`\`bash
 curl -sS -X POST "https://forge.ramenai.dev/api/v1/exemplars" \\
-  -H "Authorization: Bearer $FORGE_WRITE_TOKEN" \\
   -H "Content-Type: application/json" \\
   --data '{"receipt_id":"<uuid-from-evaluation-receipt>","domain":"fintech","task_description":"Optional task context"}'
 \`\`\`
+
+If the public path returns \`422\`, retain the receipt reference and follow the response details. If the legacy path returns \`401\`, \`503\`, \`409\`, or \`422\`, retain the lesson locally and do not substitute another credential.
 
 ## Outcome feedback
 

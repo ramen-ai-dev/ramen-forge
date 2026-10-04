@@ -22,6 +22,7 @@ export function resolveEvaluateUrl(gatewayUrl: string | undefined): string {
   return `${url.origin}${url.pathname.replace(/\/+$/, "")}${EVALUATE_PATH}`;
 }
 export const CALIBRATE_LIMIT_PER_HOUR = 50;
+export const LEDGER_LIMIT_PER_HOUR = 30;
 const HOUR_MS = 60 * 60 * 1000;
 const UPSTREAM_TIMEOUT_MS = 20_000;
 
@@ -94,18 +95,20 @@ export async function hashClientIp(purpose: string, ip: string): Promise<string>
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function hashClientKey(ip: string): Promise<string> {
-  return hashClientIp("calibrate", ip);
-}
-
 /**
  * Fixed one-hour window counter in D1. The upsert is a single atomic
  * statement, so concurrent requests cannot both read a stale count. Rows from
  * earlier windows are purged in the same batch.
  */
-export async function consumeRateLimit(db: D1Database, ip: string, now = Date.now()): Promise<RateLimitDecision> {
+async function consumeClientRateLimit(
+  db: D1Database,
+  purpose: string,
+  ip: string,
+  limit: number,
+  now = Date.now(),
+): Promise<RateLimitDecision> {
   const window = Math.floor(now / HOUR_MS);
-  const clientKey = await hashClientKey(ip);
+  const clientKey = await hashClientIp(purpose, ip);
   const [, counted] = await db.batch<{ request_count: number }>([
     db.prepare("DELETE FROM rate_limits WHERE window_start < ?").bind(window),
     db
@@ -118,11 +121,21 @@ export async function consumeRateLimit(db: D1Database, ip: string, now = Date.no
   ]);
   const count = Number(counted?.results[0]?.request_count ?? Number.MAX_SAFE_INTEGER);
   return {
-    allowed: count <= CALIBRATE_LIMIT_PER_HOUR,
-    limit: CALIBRATE_LIMIT_PER_HOUR,
-    remaining: Math.max(0, CALIBRATE_LIMIT_PER_HOUR - count),
+    allowed: count <= limit,
+    limit,
+    remaining: Math.max(0, limit - count),
     resetAt: ((window + 1) * HOUR_MS) / 1000,
   };
+}
+
+/** The existing calibration quota remains namespaced separately from ledger submissions. */
+export async function consumeRateLimit(db: D1Database, ip: string, now = Date.now()): Promise<RateLimitDecision> {
+  return consumeClientRateLimit(db, "calibrate", ip, CALIBRATE_LIMIT_PER_HOUR, now);
+}
+
+/** Public ledger-pull quota: 30 submissions per hour per client IP. */
+export async function consumeLedgerRateLimit(db: D1Database, ip: string, now = Date.now()): Promise<RateLimitDecision> {
+  return consumeClientRateLimit(db, "ledger", ip, LEDGER_LIMIT_PER_HOUR, now);
 }
 
 export type CalibrateOutcome =
