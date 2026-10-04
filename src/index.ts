@@ -126,6 +126,7 @@ async function logDemand(db: D1Database, ip: string, domain: string, toolName: s
 
 /** Map a D1 row back to foundry's CorrectionExemplar.to_dict() field names. */
 function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
+  const compliantArguments = parseStoredObject(row.repaired_arguments_json);
   return {
     exemplar_id: row.id,
     domain: row.domain,
@@ -136,7 +137,8 @@ function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
     violation_reason: row.violation_rule,
     primary_statutory_anchor: row.primary_statutory_anchor,
     steering_directive: row.steering_directive,
-    repaired_arguments: parseStoredObject(row.repaired_arguments_json),
+    compliant_arguments: compliantArguments,
+    repaired_arguments: compliantArguments,
     receipt_id: row.receipt_id,
     created_at: row.created_at,
     tier: row.tier,
@@ -152,10 +154,12 @@ function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
 /** Row as stored, with the two JSON-text columns replaced by parsed objects. */
 function toLookupRecord(row: ExemplarRow): Record<string, unknown> {
   const { failed_arguments_json: failedJson, repaired_arguments_json: repairedJson, ...rest } = row;
+  const compliantArguments = parseStoredObject(repairedJson);
   return {
     ...rest,
     failed_arguments: parseStoredObject(failedJson),
-    repaired_arguments: parseStoredObject(repairedJson),
+    compliant_arguments: compliantArguments,
+    repaired_arguments: compliantArguments,
   };
 }
 

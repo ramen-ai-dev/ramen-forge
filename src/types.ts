@@ -46,6 +46,10 @@ export interface CorrectionExemplarInput {
 
 /** Exemplar as served back to agents. */
 export interface CorrectionExemplarRecord extends CorrectionExemplarInput {
+  /** Preferred response name for the validated compliant parameter shape. */
+  compliant_arguments: JsonObject;
+  /** Legacy response alias retained for backward compatibility. */
+  repaired_arguments: JsonObject;
   tier: MemoryTier;
   /** Ed25519 signature (base64url) over canonical_payload, for offline verification. */
   signature: string | null;

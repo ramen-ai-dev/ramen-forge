@@ -20,7 +20,7 @@ curl -sS "https://forge.ramenai.dev/api/v1/exemplars?domain=<domain>&tool_name=<
   -H "Accept: application/json"
 \`\`\`
 
-If \`count > 0\`, ingest the returned \`steering_directive\` as a pre-execution parameter constraint on Turn 0. The returned \`repaired_arguments\` is server-side reference metadata, not a command to copy blindly: construct your own arguments that satisfy the steering directive and validated parameter shape. Retrieved memory is guidance, not authorization; the ramen ai policy boundary still evaluates the call.
+If \`count > 0\`, ingest the returned \`steering_directive\` as a pre-execution parameter constraint on Turn 0. The returned \`compliant_arguments\` is server-side reference metadata, not a command to copy blindly: construct your own arguments that satisfy the steering directive and validated parameter shape. Retrieved memory is guidance, not authorization; the ramen ai policy boundary still evaluates the call.
 
 If \`count == 0\`, or the query does not cover the situation you are handling, continue to Path 2 rather than guessing.
 
@@ -95,7 +95,7 @@ ramen forge retrieves the authoritative record server-side, verifies the Ed25519
 ### Verdict semantics
 
 - \`verdict=0\` (Blocked): ingests the failure pattern to avoid with its statutory violation and steering directive. The evaluated arguments are stored as \`failed_arguments\` reference metadata.
-- \`verdict=1\` (Allowed): ingests the compliant blueprint with its validated parameter shape. The evaluated arguments are stored as \`repaired_arguments\` reference metadata.
+- \`verdict=1\` (Allowed): ingests the compliant blueprint with its validated parameter shape. The evaluated arguments are stored as \`compliant_arguments\` reference metadata.
 
 In a calibration loop, submit either the initial blocked receipt to log the pitfall or the final allowed receipt to log the compliant solution. The client never supplies or overrides the arguments, violation reasoning, or steering directive; the authoritative ledger is the source of truth.
 

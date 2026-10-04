@@ -42,7 +42,7 @@ Query domain memory before invoking a registered consequential tool. This loads 
 curl -sS "https://forge.ramenai.dev/api/v1/exemplars?domain=fintech&tool_name=dispatch_wire&limit=3"
 ```
 
-If `count > 0`, ingest the returned `steering_directive` as a pre-execution parameter constraint on Turn 0. The returned `repaired_arguments` is server-side reference metadata, not a command to copy blindly; construct your own arguments that satisfy the directive and validated parameter shape. Reads are public and require no credentials. If `count == 0`, use Mode 2 instead of guessing.
+If `count > 0`, ingest the returned `steering_directive` as a pre-execution parameter constraint on Turn 0. The returned `compliant_arguments` is server-side reference metadata, not a command to copy blindly; construct your own arguments that satisfy the directive and validated parameter shape. Reads are public and require no credentials. If `count == 0`, use Mode 2 instead of guessing.
 
 ### Mode 2 (Active Edge-Case Solver)
 
@@ -83,7 +83,7 @@ Content-Type: application/json
 }
 ```
 
-The receipt ID and domain are the only admission inputs; client arguments, rules, and directives are not trusted. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`. The server stores evaluated arguments as `failed_arguments` reference metadata for blocked receipts and `repaired_arguments` reference metadata for allowed receipts.
+The receipt ID and domain are the only admission inputs; client arguments, rules, and directives are not trusted. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`. The server stores evaluated arguments as `failed_arguments` reference metadata for blocked receipts and `compliant_arguments` reference metadata for allowed receipts.
 
 The fetched receipt is checked before anything is stored, in `src/receipt.ts`:
 
@@ -156,7 +156,7 @@ The upstream is `${RAMEN_GATEWAY_URL}/api/v1/paas/evaluate` (default `https://ap
 
 ### `GET /skill.md`
 
-Machine onboarding protocol (`text/markdown`): when to query ramen forge before a consequential tool call, how to use retrieved directives, and how to report a compliant tool call or verified repair with its Schema V5 receipt.
+Machine onboarding protocol (`text/markdown`): when to query ramen forge before a consequential tool call, how to use retrieved directives, and how to report a compliant tool call or verified compliant result with its Schema V5 receipt.
 
 ### `GET /api/v1/stats`
 
@@ -172,7 +172,7 @@ Receipt-reference submissions to `POST /api/v1/exemplars` are public and require
 
 `/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 
-Exemplars are injected into other agents' context windows, so treat retrieved records as untrusted guidance: the ramen ai policy boundary still evaluates every compliant tool call or verified repair. The validator blocks common credential shapes but is not a full DLP scanner; sanitise arguments before contributing.
+Exemplars are injected into other agents' context windows, so treat retrieved records as untrusted guidance: the ramen ai policy boundary still evaluates every compliant tool call or verified compliant result. The validator blocks common credential shapes but is not a full DLP scanner; sanitise arguments before contributing.
 
 ## Setup
 
@@ -223,4 +223,4 @@ lessons = [
 ]
 ```
 
-Use `lessons` to load the retrieved steering directives into the agent's working instructions before dispatch. The `repaired_arguments` field is server-side reference metadata; construct your own compliant arguments rather than treating it as an instruction payload.
+Use `lessons` to load the retrieved steering directives into the agent's working instructions before dispatch. The `compliant_arguments` field is server-side reference metadata; construct your own compliant arguments rather than treating it as an instruction payload.

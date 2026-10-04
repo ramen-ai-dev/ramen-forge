@@ -53,6 +53,7 @@ const ALLOWED_KEYS = new Set<string>([
   "violation_reason",
   "primary_statutory_anchor",
   "steering_directive",
+  "compliant_arguments",
   "repaired_arguments",
   "receipt_id",
   "receipt",
@@ -67,7 +68,6 @@ const REQUIRED_KEYS = [
   "violation_reason",
   "primary_statutory_anchor",
   "steering_directive",
-  "repaired_arguments",
   "created_at",
 ] as const;
 
@@ -170,6 +170,9 @@ export async function validateExemplar(
   if (missing.length > 0) {
     errors.push(`missing required fields: ${missing.join(", ")}`);
   }
+  if (!("compliant_arguments" in payload) && !("repaired_arguments" in payload)) {
+    errors.push("one of compliant_arguments or repaired_arguments is required");
+  }
   if (errors.length > 0) return { ok: false, errors };
 
   const strings: string[] = [];
@@ -204,7 +207,8 @@ export async function validateExemplar(
     payload.failed_arguments === undefined || payload.failed_arguments === null
       ? {}
       : checkArguments(payload.failed_arguments, "failed_arguments", errors, strings);
-  const repairedArguments = checkArguments(payload.repaired_arguments, "repaired_arguments", errors, strings);
+  const argumentField = payload.compliant_arguments !== undefined ? "compliant_arguments" : "repaired_arguments";
+  const repairedArguments = checkArguments(payload[argumentField], argumentField, errors, strings);
 
   // The receipt itself is verified by the caller (src/receipt.ts) before this
   // runs. A top-level receipt_id, as sent by foundry's to_dict(), is optional
