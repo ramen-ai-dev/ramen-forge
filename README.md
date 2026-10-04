@@ -54,7 +54,7 @@ curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
   --data '{"domain":"industrial_iot","tool":"dispatch_manipulation","arguments":{"force_sensor":"degraded","stop":"unavailable"}}'
 ```
 
-If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. After the calibration loop produces a Schema V5 receipt, submit that complete receipt object with the lesson context through the public zero-token ingestion endpoint. The forge verifies the receipt locally; it does not perform a ledger lookup.
+If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. Once the calibration loop produces an ALLOW Schema V5 receipt, submit that complete receipt object with the lesson context and the verified compliant arguments through the public zero-token ingestion endpoint. The forge verifies the receipt locally and accepts strictly compliant blueprints (`verdict=1`); it does not perform a ledger lookup, and it never stores blocked failure patterns.
 
 ## Memory taxonomy
 
@@ -70,7 +70,7 @@ Records use the same field names as ramen foundry's `CorrectionExemplar.to_dict(
 
 ### `POST /api/v1/exemplars` (public local verification)
 
-Submits the complete Schema V5 receipt returned by calibration without authentication. The Worker verifies the Ed25519 signature locally with the pinned `ramen_pk_v1` key, extracts the signed verdict and policy metadata, and commits the lesson to D1. No upstream ledger request is made. Both `verdict=0` (blocked failure pattern) and `verdict=1` (allowed compliant blueprint) are accepted.
+Submits the complete Schema V5 receipt returned by calibration without authentication. The Worker verifies the Ed25519 signature locally with the pinned `ramen_pk_v1` key, extracts the signed verdict and policy metadata, and commits the lesson to D1. No upstream ledger request is made. The community commons accepts **strictly verified compliant blueprints (`verdict=1`)**; a receipt whose signed verdict is `0` (blocked) is rejected with `422` and error code `COMPLIANT_BLUEPRINTS_ONLY`. Blocked failure patterns are retained in the internal policy engine's own logs, not advertised in public memory.
 
 ```http
 POST https://forge.ramenai.dev/api/v1/exemplars
@@ -101,18 +101,24 @@ Content-Type: application/json
 }
 ```
 
-Pass the receipt object returned unchanged by `POST /api/v1/calibrate` or directly by `api.ramenai.dev`. Submissions require no API key, token, or `Authorization` header. `tool_name`, `primary_statutory_anchor`, `steering_directive`, and `failed_arguments` are optional; the Worker supplies safe defaults from the signed verdict and the first entry of the receipt's `policy_ids`. **`compliant_arguments` is required and must be a populated object when the receipt's verdict is `1` (ALLOW)** — an allowed blueprint exists to be copied, so an empty `{}` is rejected with `422` and error code `MISSING_COMPLIANT_ARGUMENTS` rather than silently stored. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`.
+Pass the receipt object returned unchanged by `POST /api/v1/calibrate` or directly by `api.ramenai.dev`. Submissions require no API key, token, or `Authorization` header. `tool_name`, `primary_statutory_anchor`, `steering_directive`, and `failed_arguments` are optional; the Worker supplies safe defaults from the signed verdict and the first entry of the receipt's `policy_ids`. **`compliant_arguments` is required and must be a populated object** — an allowed blueprint exists to be copied, so an empty `{}` is rejected with `422` and error code `MISSING_COMPLIANT_ARGUMENTS` rather than silently stored. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`.
 
 The local receipt verifier in `src/receipt.ts` checks before anything is stored:
 
 1. `schema_version` is `"5.0"` and `kid` is `"ramen_pk_v1"`.
 2. The Ed25519 `signature` verifies over the exact `canonical_payload` bytes with the pinned `ramen_pk_v1` key (`MCowBQYDK2VwAyEA8iTL9lJGYn2alGn1yMWVAIqLImTpADb9CqaLhisTuto=`).
-3. The signed canonical payload is valid JSON, its `id` matches `receipt.id`, and its verdict is `0` (BLOCK) or `1` (ALLOW).
+3. The signed canonical payload is valid JSON and its `id` matches `receipt.id`.
 
 A missing, unknown, invalid, or unverifiable receipt returns HTTP `422` with error code `INVALID_CRYPTOGRAPHIC_RECEIPT`:
 
 ```json
 { "success": false, "error": { "code": "INVALID_CRYPTOGRAPHIC_RECEIPT" } }
+```
+
+A verified receipt whose signed verdict is not `1` (i.e. a blocked failure pattern) returns HTTP `422` with error code `COMPLIANT_BLUEPRINTS_ONLY`:
+
+```json
+{ "success": false, "error": { "code": "COMPLIANT_BLUEPRINTS_ONLY", "message": "Exemplar rejected: Community commons accepts strictly verified compliant blueprints (verdict=1). Blocked failure patterns are retained by the internal policy engine." } }
 ```
 
 `receipt.id` is stored in the `receipt_id` column. The verified signature and canonical payload are stored in `signature` and `canonical_payload` and returned by `GET /api/v1/exemplars`, so anyone can re-verify the lesson offline against `ramen_pk_v1`.
@@ -127,7 +133,7 @@ Payloads are rejected with `422` and a list of reasons when they:
 - appear to contain credentials (private keys, AWS keys, GitHub/Slack tokens, JWTs, bearer tokens, `sk-` API keys)
 - carry a verdict `1` (ALLOW) receipt with a missing or empty `compliant_arguments` (error code `MISSING_COMPLIANT_ARGUMENTS`)
 
-The `task_fingerprint` is calculated as SHA-256 of `task_description`. Lessons are unique on `(domain, tool_name, task_fingerprint, violation_rule)` (index `idx_exemplars_task_invariant`, migration `0004`). An existing invariant keeps its id, and the `ON CONFLICT ... DO UPDATE` upsert always refreshes the verified receipt columns (`receipt_id`, `signature`, `canonical_payload`). It is an **enrichment upsert**: each content column (`repaired_arguments_json`, `failed_arguments_json`, `steering_directive`, `primary_statutory_anchor`) only overwrites the stored value when the incoming submission carries something more specific than an empty placeholder or the server's generic default — otherwise the existing value is kept. This lets a later, richer resubmission for the same invariant heal a thin or empty row without letting a thinner later resubmission regress a row that already has good content. The response still returns `201` with `refreshed: true`. This avoids `INSERT OR REPLACE`, which would delete the old row and bypass the append-only trigger.
+The `task_fingerprint` is calculated as SHA-256 of `task_description`. Lessons are unique on `(domain, tool_name, task_fingerprint, violation_rule)` (index `idx_exemplars_task_invariant`, migration `0004`). An existing invariant keeps its id, and the `ON CONFLICT ... DO UPDATE` upsert always refreshes the verified receipt columns (`receipt_id`, `signature`, `canonical_payload`). **Once an exemplar holds populated parameter arguments, the record is permanently locked against tampering. Subsequent resubmissions update cryptographic proof metadata only.** Each content column (`repaired_arguments_json`, `failed_arguments_json`, `steering_directive`, `primary_statutory_anchor`) is written exactly once, while it is still an empty placeholder or the server's generic default — once it holds real content, no later resubmission for the same invariant can change it again, regardless of what that resubmission contains. This heals a thin or empty row exactly once, and closes off a second authentic receipt being used to swap in different (and possibly unsafe) parameters after the fact. The response still returns `201` with `refreshed: true`. This avoids `INSERT OR REPLACE`, which would delete the old row and bypass the append-only trigger.
 
 A duplicate `exemplar_id` for a different invariant returns `409`. Everything ingested is stored as `tier = 'community'`.
 

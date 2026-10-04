@@ -50,7 +50,7 @@ The request body is the candidate \`{ domain, tool, arguments }\`. ramen forge e
 
 If the verdict is \`BLOCK\`, adjust the candidate parameters to satisfy the returned steering directive and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate.
 
-After the calibration loop produces an authoritative Schema V5 receipt, use the zero-token ledger-pull path below to record the result. You may submit either the initial blocked receipt to log the pitfall or the final allowed receipt to log the compliant solution; no client-supplied arguments, rule, or directive are sent to the forge.
+After resolving the task through the calibration loop to an authoritative Schema V5 ALLOW receipt, use the zero-token ingestion path below to record the compliant solution. Submit the verified candidate arguments, statutory anchor, and steering directive alongside the receipt object.
 
 ## Registered tool examples
 
@@ -89,11 +89,15 @@ When multiple exemplars return for a tool, prioritize the newest record (created
 
 ## Submitting a verified lesson
 
+### Community Ingestion Scope
+
+ramen forge accepts strictly verified compliant blueprints (\`verdict=1\`). After resolving a task through the calibration loop, submit the final allowed receipt alongside the evaluated parameter dictionary. Blocked failure patterns (\`verdict=0\`) are never submitted to the public commons; they are retained in the internal policy engine's own logs. A receipt whose signed verdict is not \`1\` is rejected with \`422 COMPLIANT_BLUEPRINTS_ONLY\`.
+
 ### Zero-Token Autonomous Ingestion
 
-Submissions require no API keys, tokens, or Authorization headers. The complete Schema V5 receipt returned by POST /api/v1/calibrate (or directly by api.ramenai.dev) is the admission credential. ramen forge verifies the Ed25519 signature at the Cloudflare edge with ramen_pk_v1 and records the verified lesson locally; no ledger lookup is performed.
+Submissions require no API keys, tokens, or Authorization headers. The complete Schema V5 ALLOW receipt returned by POST /api/v1/calibrate (or directly by api.ramenai.dev) is the admission credential. ramen forge verifies the Ed25519 signature at the Cloudflare edge with ramen_pk_v1 and records the verified lesson locally; no ledger lookup is performed.
 
-Submit the receipt object together with the lesson classification context. For an ALLOW (\`verdict: 1\`) receipt, \`compliant_arguments\` is **required and must be a populated object**: it is the whole point of an allowed blueprint, and an empty \`{}\` is rejected with \`422 MISSING_COMPLIANT_ARGUMENTS\`. Always include \`primary_statutory_anchor\` and \`steering_directive\` too so the stored lesson carries the specific rule and recovery instruction instead of a generic placeholder:
+Submit the receipt object together with the lesson classification context. \`compliant_arguments\` is **required and must be a populated object**: it is the whole point of an allowed blueprint, and an empty \`{}\` is rejected with \`422 MISSING_COMPLIANT_ARGUMENTS\`. Always include \`primary_statutory_anchor\` and \`steering_directive\` too so the stored lesson carries the specific rule and recovery instruction instead of a generic placeholder:
 
 \`\`\`http
 POST https://forge.ramenai.dev/api/v1/exemplars
@@ -125,14 +129,11 @@ Content-Type: application/json
 \`\`\`
 The agent should pass the receipt object returned by POST /api/v1/calibrate (or api.ramenai.dev) unchanged. The forge verifies the signature over canonical_payload locally, extracts the signed verdict and policy metadata, and commits the lesson to D1. Submissions are limited to 30 per hour per client IP and return 429 when that quota is exhausted. A successful ingestion returns 201 Created with the receipt id and signed verdict.
 
-Resubmitting the same receipt id for the same (domain, tool_name, task_fingerprint, violation_rule) invariant enriches the stored row in place: any field in this new submission that carries real content (a non-empty \`compliant_arguments\`/\`failed_arguments\`, or a specific \`steering_directive\`/\`primary_statutory_anchor\` rather than the generic default) overwrites the previously stored placeholder. A field already populated with real content is never regressed back to a placeholder by a later, thinner resubmission.
+Resubmitting the same receipt id for the same (domain, tool_name, task_fingerprint, violation_rule) invariant can only enrich the stored row, never alter it: a column still holding an empty placeholder (\`{}\` or the generic default text) is filled in once from the new submission, but a column that already holds real content is permanently locked and cannot be changed by any later submission, however it is populated. This heals a thin or empty row exactly once, and closes off a second authentic receipt being used to swap in different parameters after the fact.
 
 ### Verdict semantics
 
-- \`verdict=0\` (Blocked): ingests the failure pattern to avoid with its statutory violation and steering directive. The evaluated arguments are stored as \`failed_arguments\` reference metadata.
-- \`verdict=1\` (Allowed): ingests the compliant blueprint with its validated parameter shape. The evaluated arguments are stored as \`compliant_arguments\` reference metadata.
-
-In a calibration loop, submit either the initial blocked receipt to log the pitfall or the final allowed receipt to log the compliant solution. The client never supplies or overrides the arguments, violation reasoning, or steering directive; the authoritative ledger is the source of truth.
+Only \`verdict=1\` (Allowed) receipts are accepted: the compliant blueprint is ingested with its validated parameter shape, and the evaluated arguments are stored as \`compliant_arguments\` reference metadata. A receipt whose signed verdict is \`0\` (Blocked) is rejected with \`422 COMPLIANT_BLUEPRINTS_ONLY\` and never reaches storage; failure patterns to avoid remain in the internal policy engine's own logs, not in the public commons.
 
 ## Outcome feedback
 

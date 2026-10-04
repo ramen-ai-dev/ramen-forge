@@ -75,16 +75,33 @@ function enrichedExemplarUpsert(rows: ExemplarRow[], binds: unknown[]): { id: st
     return { id: exemplarId };
   }
 
-  // Mirrors UPSERT_SQL's CASE WHEN excluded.<col> ... THEN excluded.<col> ELSE exemplars.<col> END.
+  // Mirrors UPSERT_SQL's CASE WHEN (exemplars.<col> is still a placeholder) AND
+  // (excluded.<col> is real) THEN excluded.<col> ELSE exemplars.<col> END. The gate is on the
+  // EXISTING column, not the incoming one: once a column holds real content, it is locked
+  // and no incoming value - however populated - can change it again.
   existing.receipt_id = receiptId;
   existing.signature = signature;
   existing.canonical_payload = canonicalPayload;
-  if (repairedArgumentsJson != null && repairedArgumentsJson !== "{}") existing.repaired_arguments_json = repairedArgumentsJson;
-  if (failedArgumentsJson != null && failedArgumentsJson !== "{}") existing.failed_arguments_json = failedArgumentsJson;
-  if (steeringDirective != null && steeringDirective !== "" && steeringDirective !== "Compliant operational blueprint") {
+  const repairedIsPlaceholder = existing.repaired_arguments_json === "{}" || existing.repaired_arguments_json == null;
+  if (repairedIsPlaceholder && repairedArgumentsJson != null && repairedArgumentsJson !== "{}") {
+    existing.repaired_arguments_json = repairedArgumentsJson;
+  }
+  const failedIsPlaceholder = existing.failed_arguments_json === "{}" || existing.failed_arguments_json == null;
+  if (failedIsPlaceholder && failedArgumentsJson != null && failedArgumentsJson !== "{}") {
+    existing.failed_arguments_json = failedArgumentsJson;
+  }
+  const steeringIsPlaceholder =
+    existing.steering_directive === "Compliant operational blueprint" || existing.steering_directive === "" || existing.steering_directive == null;
+  if (steeringIsPlaceholder && steeringDirective != null && steeringDirective !== "" && steeringDirective !== "Compliant operational blueprint") {
     existing.steering_directive = steeringDirective;
   }
+  const anchorIsPlaceholder =
+    existing.primary_statutory_anchor === "Policy unknown" ||
+    existing.primary_statutory_anchor === "Statutory Invariant (Policy unknown)" ||
+    existing.primary_statutory_anchor === "" ||
+    existing.primary_statutory_anchor == null;
   if (
+    anchorIsPlaceholder &&
     primaryStatutoryAnchor != null &&
     primaryStatutoryAnchor !== "" &&
     primaryStatutoryAnchor !== "Policy unknown" &&
@@ -282,7 +299,7 @@ describe("self-contained exemplar ingestion", () => {
     expect((await response.json()).error.code).toBe("MISSING_COMPLIANT_ARGUMENTS");
   });
 
-  it("accepts a signed blocked verdict and returns it", async () => {
+  it("rejects a signed blocked (verdict=0) receipt as COMPLIANT_BLUEPRINTS_ONLY", async () => {
     vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
 
     const response = await app.request(
@@ -299,8 +316,12 @@ describe("self-contained exemplar ingestion", () => {
       envWith(),
     );
 
-    expect(response.status).toBe(201);
-    expect(await response.json()).toMatchObject({ success: true, exemplar_id: receiptId, verdict: 0 });
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.error.code).toBe("COMPLIANT_BLUEPRINTS_ONLY");
+    expect(body.error.message).toBe(
+      "Exemplar rejected: Community commons accepts strictly verified compliant blueprints (verdict=1). Blocked failure patterns are retained by the internal policy engine.",
+    );
   });
 
   it("rejects an invalid signature as INVALID_CRYPTOGRAPHIC_RECEIPT", async () => {
@@ -340,7 +361,7 @@ describe("self-contained exemplar ingestion", () => {
   });
 });
 
-describe("enrichment upsert", () => {
+describe("enrichment upsert and immutability lock", () => {
   it("enriches an existing thin row's repaired_arguments_json on resubmission instead of leaving it empty", async () => {
     vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
 
@@ -405,6 +426,74 @@ describe("enrichment upsert", () => {
     expect(thinRow.steering_directive).toBe("Ensure certified safety envelope and human-supervised control.");
     void enriched;
     void queries;
+  });
+
+  it("permanently locks repaired_arguments_json once populated, rejecting a later swap attempt", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+
+    const taskDescription = "Supervised handling of molten-metal crucible in certified workcell";
+    const taskFingerprint = await sha256Hex(taskDescription);
+    const originalArguments = {
+      robot_id: "ROBOHARM-ARM-01",
+      action_type: "PICK_AND_PLACE",
+      target_object: "identified molten-metal crucible",
+      commanded_velocity_mps: 0.05,
+      commanded_force_nm: 10,
+      scene_context_id: "CERTIFIED_HIGH_ENERGY_CELL",
+    };
+
+    // This row's repaired_arguments_json is already populated with safe, verified
+    // parameters -- the state the immutability lock exists to protect.
+    const richRow = makeRow({
+      id: receiptId,
+      domain: "industrial_iot",
+      tool_name: "dispatch_manipulation",
+      task_description: taskDescription,
+      task_fingerprint: taskFingerprint,
+      violation_rule: "No violation: compliant reference action",
+      primary_statutory_anchor: "ISO 10218-1:2025",
+      steering_directive: "Ensure certified safety envelope and human-supervised control.",
+      failed_arguments_json: "{}",
+      repaired_arguments_json: JSON.stringify(originalArguments),
+      receipt_id: receiptId,
+    });
+    const { db } = createDb([richRow]);
+    const env: Env = { DB: db, FORGE_WRITE_TOKEN: "test-write-token", RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    // A second authentic receipt for the same invariant, carrying a different
+    // (here: malicious) parameter dictionary -- the sabotage vector the lock closes.
+    const tamperedArguments = {
+      robot_id: "ROBOHARM-ARM-01",
+      action_type: "PICK_AND_PLACE",
+      target_object: "identified molten-metal crucible",
+      commanded_velocity_mps: 5.0,
+      commanded_force_nm: 500,
+      scene_context_id: "CERTIFIED_HIGH_ENERGY_CELL",
+    };
+
+    const response = await app.request(
+      "/api/v1/exemplars",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          domain: "industrial_iot",
+          tool_name: "dispatch_manipulation",
+          task_description: taskDescription,
+          primary_statutory_anchor: "ISO 10218-1:2025",
+          steering_directive: "Ensure certified safety envelope and human-supervised control.",
+          compliant_arguments: tamperedArguments,
+          receipt: receiptFixture(1),
+        }),
+      },
+      env,
+    );
+
+    // The resubmission itself is still accepted (receipt proof refreshes), but the
+    // stored arguments must not change: the lock makes the column write a no-op.
+    expect(response.status).toBe(201);
+    expect(JSON.parse(richRow.repaired_arguments_json)).toEqual(originalArguments);
+    expect(JSON.parse(richRow.repaired_arguments_json)).not.toEqual(tamperedArguments);
   });
 
   it("does not regress already-specific steering text when a later resubmission omits it", async () => {

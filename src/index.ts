@@ -41,7 +41,7 @@ const MAX_OFFSET = 10_000;
 const COMMUNITY_TIER = "community";
 
 /**
- * Insert a new lesson, or enrich an existing one with the same
+ * Insert a new lesson, or refresh the receipt of an existing one with the same
  * (domain, tool_name, task_fingerprint, violation_rule) invariant
  * (idx_exemplars_task_invariant, migration 0004).
  *
@@ -52,12 +52,13 @@ const COMMUNITY_TIER = "community";
  *
  * The receipt columns (receipt_id, signature, canonical_payload) always refresh
  * to the incoming receipt. The content columns (arguments, steering text, anchor)
- * only overwrite the stored value when the incoming one is more informative than
- * both an empty placeholder and the server's own generic default, otherwise the
- * existing value is kept. This lets a later, richer resubmission for the same
- * invariant heal a thin or empty row (e.g. a submission that initially omitted
- * compliant_arguments) without letting a later thin resubmission regress a row
- * that already has good content.
+ * are a one-way enrichment, never a two-way sync: each one is written only while
+ * the stored value is still an empty/placeholder stand-in, and once a column holds
+ * real content it is permanently locked — no later submission, however it's
+ * populated, can change it again. This still heals a thin or empty row (e.g. a
+ * submission that initially omitted compliant_arguments) exactly once, while
+ * closing the sabotage vector where a second authentic receipt for the same
+ * invariant swaps in different (and possibly unsafe) parameters after the fact.
  *
  * A duplicate exemplar_id still raises UNIQUE on the primary key (409).
  */
@@ -70,19 +71,31 @@ const UPSERT_SQL =
   "signature = excluded.signature, " +
   "canonical_payload = excluded.canonical_payload, " +
   "repaired_arguments_json = CASE " +
-  "WHEN excluded.repaired_arguments_json IS NOT NULL AND excluded.repaired_arguments_json != '{}' " +
+  "WHEN (exemplars.repaired_arguments_json = '{}' OR exemplars.repaired_arguments_json IS NULL) " +
+  "AND excluded.repaired_arguments_json != '{}' AND excluded.repaired_arguments_json IS NOT NULL " +
   "THEN excluded.repaired_arguments_json ELSE exemplars.repaired_arguments_json END, " +
   "failed_arguments_json = CASE " +
-  "WHEN excluded.failed_arguments_json IS NOT NULL AND excluded.failed_arguments_json != '{}' " +
+  "WHEN (exemplars.failed_arguments_json = '{}' OR exemplars.failed_arguments_json IS NULL) " +
+  "AND excluded.failed_arguments_json != '{}' AND excluded.failed_arguments_json IS NOT NULL " +
   "THEN excluded.failed_arguments_json ELSE exemplars.failed_arguments_json END, " +
   "steering_directive = CASE " +
-  "WHEN excluded.steering_directive IS NOT NULL AND excluded.steering_directive != '' " +
-  "AND excluded.steering_directive != 'Compliant operational blueprint' " +
+  "WHEN (exemplars.steering_directive = 'Compliant operational blueprint' OR exemplars.steering_directive = '' " +
+  "OR exemplars.steering_directive IS NULL) " +
+  "AND excluded.steering_directive != 'Compliant operational blueprint' AND excluded.steering_directive != '' " +
+  "AND excluded.steering_directive IS NOT NULL " +
   "THEN excluded.steering_directive ELSE exemplars.steering_directive END, " +
+  // The literal 'Policy unknown' placeholder is matched for forward compatibility, but the
+  // server's actual generated default (see receiptMetadata()) is the longer
+  // "Statutory Invariant (Policy unknown)" string, which must also be recognised as a
+  // placeholder or this column could never be healed once a submission omits the anchor
+  // and the receipt's policy id can't be resolved.
   "primary_statutory_anchor = CASE " +
-  "WHEN excluded.primary_statutory_anchor IS NOT NULL AND excluded.primary_statutory_anchor != '' " +
+  "WHEN (exemplars.primary_statutory_anchor = 'Policy unknown' " +
+  "OR exemplars.primary_statutory_anchor = 'Statutory Invariant (Policy unknown)' " +
+  "OR exemplars.primary_statutory_anchor = '' OR exemplars.primary_statutory_anchor IS NULL) " +
   "AND excluded.primary_statutory_anchor != 'Policy unknown' " +
-  "AND excluded.primary_statutory_anchor NOT LIKE 'Statutory Invariant (Policy unknown)' " +
+  "AND excluded.primary_statutory_anchor != 'Statutory Invariant (Policy unknown)' " +
+  "AND excluded.primary_statutory_anchor != '' AND excluded.primary_statutory_anchor IS NOT NULL " +
   "THEN excluded.primary_statutory_anchor ELSE exemplars.primary_statutory_anchor END " +
   "RETURNING id";
 
@@ -284,6 +297,9 @@ app.post("/api/v1/exemplars", async (c) => {
   }
 
   const body = parsed.body;
+  // allowBlocked stays true here only so a BLOCK receipt can be verified far enough
+  // to read its verdict; the COMPLIANT_BLUEPRINTS_ONLY gate right below is what
+  // actually keeps verdict=0 receipts out of the public commons.
   const receipt = await verifyExemplarReceipt(isPlainObject(body) ? body.receipt : undefined, { allowBlocked: true });
   if (!receipt.ok) {
     return c.json(
@@ -292,28 +308,44 @@ app.post("/api/v1/exemplars", async (c) => {
     );
   }
 
-  const metadata = receiptMetadata(receipt);
-  const request = isPlainObject(body) ? body : {};
   const signedVerdict = receipt.verdict;
 
-  // Allowed blueprints (verdict=1) exist to be copied: an empty compliant_arguments
-  // dictionary stores a lesson with nothing to apply. Require it populated up front,
-  // before the generic validator (which treats {} as a structurally valid object).
-  if (signedVerdict === 1) {
-    const submittedArguments = request.compliant_arguments ?? request.repaired_arguments;
-    const populated = isPlainObject(submittedArguments) && Object.keys(submittedArguments).length > 0;
-    if (!populated) {
-      return c.json(
-        {
-          success: false,
-          error: {
-            code: "MISSING_COMPLIANT_ARGUMENTS",
-            message: "Exemplar rejected: Allowed blueprints (verdict=1) must provide a populated compliant_arguments dictionary.",
-          },
+  // Community commons stores strictly verified compliant blueprints. Blocked failure
+  // patterns stay in the internal policy engine's own logs and are never ingested here,
+  // so a verdict=0 receipt is rejected before any content fields are even read.
+  if (signedVerdict !== 1) {
+    return c.json(
+      {
+        success: false,
+        error: {
+          code: "COMPLIANT_BLUEPRINTS_ONLY",
+          message:
+            "Exemplar rejected: Community commons accepts strictly verified compliant blueprints (verdict=1). Blocked failure patterns are retained by the internal policy engine.",
         },
-        422,
-      );
-    }
+      },
+      422,
+    );
+  }
+
+  const metadata = receiptMetadata(receipt);
+  const request = isPlainObject(body) ? body : {};
+
+  // Allowed blueprints exist to be copied: an empty compliant_arguments dictionary
+  // stores a lesson with nothing to apply. Require it populated up front, before the
+  // generic validator (which treats {} as a structurally valid object).
+  const submittedArguments = request.compliant_arguments ?? request.repaired_arguments;
+  const populated = isPlainObject(submittedArguments) && Object.keys(submittedArguments).length > 0;
+  if (!populated) {
+    return c.json(
+      {
+        success: false,
+        error: {
+          code: "MISSING_COMPLIANT_ARGUMENTS",
+          message: "Exemplar rejected: Allowed blueprints (verdict=1) must provide a populated compliant_arguments dictionary.",
+        },
+      },
+      422,
+    );
   }
 
   const exemplarBody = {
