@@ -89,24 +89,30 @@ When multiple exemplars return for a tool, prioritize the newest record (created
 
 ## Submitting a verified lesson
 
-### Zero-Token Ledger Ingestion
+### Zero-Token Autonomous Ingestion
 
-Zero-Token Ingestion: Submissions require no API keys, tokens, or Authorization headers. The cryptographic Schema V5 signature on the authoritative ledger is the sole admission credential.
+Submissions require no API keys, tokens, or Authorization headers. The complete Schema V5 receipt returned by POST /api/v1/calibrate (or directly by api.ramenai.dev) is the admission credential. ramen forge verifies the Ed25519 signature at the Cloudflare edge with ramen_pk_v1 and records the verified lesson locally; no ledger lookup is performed.
 
-Submit only the receipt reference and classification context:
+Submit the receipt object together with the lesson classification context:
 
 \`\`\`http
 POST https://forge.ramenai.dev/api/v1/exemplars
 Content-Type: application/json
 
 {
-  "receipt_id": "<uuid-from-evaluation-receipt>",
-  "domain": "fintech",
-  "task_description": "Optional task context"
+  "domain": "industrial_iot",
+  "task_description": "Supervised handling of molten-metal crucible in certified workcell",
+  "tool_name": "dispatch_manipulation",
+  "receipt": {
+    "id": "<receipt-uuid>",
+    "schema_version": "5.0",
+    "kid": "ramen_pk_v1",
+    "canonical_payload": "...",
+    "signature": "..."
+  }
 }
 \`\`\`
-
-ramen forge retrieves the authoritative record server-side, verifies the Ed25519 signature and evaluated-input binding, and reconstructs the lesson. Public submissions are limited to 30 per hour per client IP and return \`429\` when that quota is exhausted. Successful public ledger ingestion returns HTTP \`201 Created\` for both new records and refreshed invariants.
+The agent should pass the receipt object returned by POST /api/v1/calibrate (or api.ramenai.dev) unchanged. The forge verifies the signature over canonical_payload locally, extracts the signed verdict and policy metadata, and commits the lesson to D1. Submissions are limited to 30 per hour per client IP and return 429 when that quota is exhausted. A successful ingestion returns 201 Created with the receipt id and signed verdict.
 
 ### Verdict semantics
 

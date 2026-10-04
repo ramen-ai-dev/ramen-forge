@@ -65,7 +65,14 @@ function createDb(rows: ExemplarRow[]) {
       return statement;
     },
     async batch() {
-      return [{ results: [] }, { results: [{ request_count: 1 }] }];
+      const lastQuery = queries.at(-1)?.sql ?? "";
+      if (lastQuery.includes("RETURNING request_count")) {
+        return [{ results: [] }, { results: [{ request_count: 1 }] }];
+      }
+      if (lastQuery.includes("RETURNING id")) {
+        return [{ results: [] }, { results: [{ id: String(queries.at(-1)?.binds[0]) }] }];
+      }
+      return [{ results: [] }, { results: [] }];
     },
   };
   return { db: db as unknown as D1Database, queries };
@@ -77,6 +84,25 @@ function envWith(rows: ExemplarRow[] = [makeRow()]): Env {
     FORGE_WRITE_TOKEN: "test-write-token",
     RAMEN_API_KEY: "test-api-key",
     RAMEN_GATEWAY_URL: "https://gateway.example.test",
+  };
+}
+
+const receiptId = "33333333-3333-4333-8333-333333333333";
+
+function receiptFixture(verdict: 0 | 1 = 1) {
+  const canonicalPayload = JSON.stringify({
+    schema_version: "5.0",
+    kid: "ramen_pk_v1",
+    id: receiptId,
+    verdict,
+    policy_id: "industrial_iot_actuation_invariance",
+  });
+  return {
+    id: receiptId,
+    schema_version: "5.0",
+    kid: "ramen_pk_v1",
+    canonical_payload: canonicalPayload,
+    signature: btoa("\u0000".repeat(64)),
   };
 }
 
@@ -95,38 +121,92 @@ describe("skill and calibration wire contract", () => {
   });
 });
 
-describe("exemplar routing", () => {
-  it("routes auxiliary-key ledger submissions without bearer auth", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("not found", { status: 404 })));
+describe("self-contained exemplar ingestion", () => {
+  it("verifies and stores a complete receipt without upstream network access", async () => {
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+
     const response = await app.request(
       "/api/v1/exemplars",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          receipt_id: "33333333-3333-4333-8333-333333333333",
-          domain: "fintech",
-          client_metadata: { source: "test" },
+          domain: "industrial_iot",
+          task_description: "Supervised handling of molten-metal crucible in certified workcell",
+          tool_name: "dispatch_manipulation",
+          receipt: receiptFixture(),
         }),
       },
       envWith(),
     );
-    expect(response.status).toBe(422);
-    expect(response.status).not.toBe(401);
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      success: true,
+      exemplar_id: receiptId,
+      verdict: 1,
+    });
     expect(response.headers.get("RateLimit-Limit")).toBe("30");
+    expect(upstream).not.toHaveBeenCalled();
   });
 
-  it("rejects legacy full payloads without a bearer token", async () => {
+  it("accepts a signed blocked verdict and returns it", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+
     const response = await app.request(
       "/api/v1/exemplars",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ receipt_id: "not-a-ledger-request", tool_name: "dispatch_wire" }),
+        body: JSON.stringify({
+          domain: "industrial_iot",
+          task_description: "Blocked crucible action",
+          receipt: receiptFixture(0),
+        }),
       },
       envWith(),
     );
-    expect(response.status).toBe(401);
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ success: true, exemplar_id: receiptId, verdict: 0 });
+  });
+
+  it("rejects an invalid signature as INVALID_CRYPTOGRAPHIC_RECEIPT", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(false);
+
+    const response = await app.request(
+      "/api/v1/exemplars",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          domain: "industrial_iot",
+          task_description: "Supervised handling of molten-metal crucible in certified workcell",
+          receipt: receiptFixture(),
+        }),
+      },
+      envWith(),
+    );
+
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe("INVALID_CRYPTOGRAPHIC_RECEIPT");
+  });
+
+  it("rejects a missing receipt without bearer authentication", async () => {
+    const response = await app.request(
+      "/api/v1/exemplars",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", task_description: "Missing receipt" }),
+      },
+      envWith(),
+    );
+
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe("INVALID_CRYPTOGRAPHIC_RECEIPT");
   });
 });
 
