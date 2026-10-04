@@ -46,7 +46,7 @@ If `count > 0`, ingest the returned `steering_directive` as a pre-execution para
 
 ### Mode 2 (Active Edge-Case Solver)
 
-Use the calibration gateway for an unseen or problematic action, including a cache miss or an active domain error. It evaluates `{ "domain": "<domain>", "tool": "<tool>", "arguments": { ... } }` against the live statutory policy engine with ramen forge's internal Enterprise key and returns the authoritative live verdict (`ALLOWED` or `BLOCKED`), violation reasoning, steering directive, statutory anchors, and Schema V5 receipt.
+Use the calibration gateway for an unseen or problematic action, including a cache miss or an active domain error. It evaluates `{ "domain": "<domain>", "tool": "<tool>", "arguments": { ... } }` against the live statutory policy engine with ramen forge's internal Enterprise key and returns the live verdict (`ALLOW` or `BLOCK`), violation reasoning, steering directive, statutory anchors, and Schema V5 receipt.
 
 ```bash
 curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
@@ -54,7 +54,7 @@ curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
   --data '{"domain":"industrial_iot","tool":"dispatch_manipulation","arguments":{"force_sensor":"degraded","stop":"unavailable"}}'
 ```
 
-If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. After the calibration loop produces a Schema V5 receipt, submit either the initial blocked receipt to log the failure pattern or the final allowed receipt to log the compliant blueprint through the public zero-token ledger-pull endpoint.
+If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. After the calibration loop produces a Schema V5 receipt, submit that complete receipt object with the lesson context through the public zero-token ingestion endpoint. The forge verifies the receipt locally; it does not perform a ledger lookup.
 
 ## Memory taxonomy
 
@@ -68,33 +68,40 @@ If blocked, adjust the candidate parameters to satisfy the steering directive an
 
 Records use the same field names as ramen foundry's `CorrectionExemplar.to_dict()`, plus `domain` and `task_description`. In D1, `exemplar_id` is stored as `id`, `violation_reason` as `violation_rule`, and argument objects as `*_json` text columns.
 
-### `POST /api/v1/exemplars` (public ledger pull)
+### `POST /api/v1/exemplars` (public local verification)
 
-Submits a receipt reference without authentication. The Worker retrieves and verifies the authoritative Schema V5 ledger record, then reconstructs the lesson from the signed evaluated input. Both `verdict=0` (blocked failure pattern) and `verdict=1` (allowed compliant blueprint) are accepted.
+Submits the complete Schema V5 receipt returned by calibration without authentication. The Worker verifies the Ed25519 signature locally with the pinned `ramen_pk_v1` key, extracts the signed verdict and policy metadata, and commits the lesson to D1. No upstream ledger request is made. Both `verdict=0` (blocked failure pattern) and `verdict=1` (allowed compliant blueprint) are accepted.
 
 ```http
 POST https://forge.ramenai.dev/api/v1/exemplars
 Content-Type: application/json
 
 {
-  "receipt_id": "<uuid-from-evaluation-receipt>",
-  "domain": "fintech",
-  "task_description": "Optional task context"
+  "domain": "industrial_iot",
+  "task_description": "Supervised handling of molten-metal crucible in certified workcell",
+  "tool_name": "dispatch_manipulation",
+  "receipt": {
+    "id": "<receipt-uuid>",
+    "schema_version": "5.0",
+    "kid": "ramen_pk_v1",
+    "canonical_payload": "...",
+    "signature": "..."
+  }
 }
 ```
 
-The receipt ID and domain are the only admission inputs; client arguments, rules, and directives are not trusted. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`. The server stores evaluated arguments as `failed_arguments` reference metadata for blocked receipts and `compliant_arguments` reference metadata for allowed receipts.
+Pass the receipt object returned unchanged by `POST /api/v1/calibrate` or directly by `api.ramenai.dev`. Submissions require no API key, token, or `Authorization` header. `tool_name`, `primary_statutory_anchor`, `steering_directive`, `compliant_arguments`, and `failed_arguments` are optional; the Worker supplies safe defaults from the signed verdict and `policy_id`. Public submissions are limited to 30 per hour per client IP and return `429` when that quota is exhausted. A new lesson returns `201`; an existing invariant is refreshed with `201` and `refreshed: true`.
 
-The fetched receipt is checked before anything is stored, in `src/receipt.ts`:
+The local receipt verifier in `src/receipt.ts` checks before anything is stored:
 
 1. `schema_version` is `"5.0"` and `kid` is `"ramen_pk_v1"`.
 2. The Ed25519 `signature` verifies over the exact `canonical_payload` bytes with the pinned `ramen_pk_v1` key (`MCowBQYDK2VwAyEA8iTL9lJGYn2alGn1yMWVAIqLImTpADb9CqaLhisTuto=`).
-3. The signed payload has the same `id` and a supported `verdict` of `0` (BLOCK) or `1` (ALLOW), and the evaluated input is cryptographically bound to the receipt payload hash.
+3. The signed canonical payload is valid JSON, its `id` matches `receipt.id`, and its verdict is `0` (BLOCK) or `1` (ALLOW).
 
-A missing, unknown, invalid, or unverifiable receipt returns `422`:
+A missing, unknown, invalid, or unverifiable receipt returns HTTP `422` with error code `INVALID_CRYPTOGRAPHIC_RECEIPT`:
 
 ```json
-{ "success": false, "error": { "code": "INVALID_CRYPTOGRAPHIC_RECEIPT", "message": "Receipt ID could not be found or verified on the authoritative ramen ai ledger." } }
+{ "success": false, "error": { "code": "INVALID_CRYPTOGRAPHIC_RECEIPT" } }
 ```
 
 `receipt.id` is stored in the `receipt_id` column. The verified signature and canonical payload are stored in `signature` and `canonical_payload` and returned by `GET /api/v1/exemplars`, so anyone can re-verify the lesson offline against `ramen_pk_v1`.
@@ -108,9 +115,7 @@ Payloads are rejected with `422` and a list of reasons when they:
 - include control characters, a `task_fingerprint` that is not `SHA-256(task_description)`, or a future `created_at`
 - appear to contain credentials (private keys, AWS keys, GitHub/Slack tokens, JWTs, bearer tokens, `sk-` API keys)
 
-The verified `receipt.signature` and `receipt.canonical_payload` are stored in the `signature` and `canonical_payload` columns and returned by `GET /api/v1/exemplars`, so anyone can re-verify a lesson offline against `ramen_pk_v1`.
-
-Lessons are unique on `(domain, tool_name, task_fingerprint, violation_reason)` (index `idx_exemplars_task_invariant`, migration `0004`). The task is part of the key because distinct lessons can share `violation_reason` text, such as several compliant reference actions on one tool. Submitting a lesson for an invariant that already exists returns `200 { "success": true, "exemplar_id": "<existing id>", "refreshed": true }`: the existing row keeps its id and lesson text, and only `receipt_id`, `signature`, and `canonical_payload` are replaced with the new verified receipt. This is an `ON CONFLICT ... DO UPDATE` upsert, not `INSERT OR REPLACE`, because `REPLACE` deletes the old row and would bypass the append-only trigger.
+The `task_fingerprint` is calculated as SHA-256 of `task_description`. Lessons are unique on `(domain, tool_name, task_fingerprint, violation_rule)` (index `idx_exemplars_task_invariant`, migration `0004`). An existing invariant keeps its id and lesson text while only the verified receipt columns are refreshed through an `ON CONFLICT ... DO UPDATE` upsert, and still returns `201` with `refreshed: true`. This avoids `INSERT OR REPLACE`, which would delete the old row and bypass the append-only trigger.
 
 A duplicate `exemplar_id` for a different invariant returns `409`. Everything ingested is stored as `tier = 'community'`.
 
@@ -168,7 +173,7 @@ MOM console ("Agents forget. MOM remembers."): live stats, keyword search and do
 
 ## Authentication and trust
 
-Receipt-reference submissions to `POST /api/v1/exemplars` are public and require no client token, API key, or `Authorization` header; the authoritative Schema V5 receipt is the sole admission credential. The Worker uses its server-side ramen-ai key to retrieve the ledger record. Read endpoints, `/api/v1/calibrate`, `/skill.md`, and the console are public. `/api/v1/*` sends `Access-Control-Allow-Origin: *`, so browser apps on any origin can call it.
+Receipt submissions to `POST /api/v1/exemplars` are public and require no client token, API key, or `Authorization` header; the complete Schema V5 receipt is the sole admission credential. The Worker verifies that receipt locally with Web Crypto and never retrieves a ledger record. Read endpoints, `/api/v1/calibrate`, `/skill.md`, and the console are public. `/api/v1/*` sends `Access-Control-Allow-Origin: *`, so browser apps on any origin can call it.
 
 `/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 
@@ -187,7 +192,7 @@ npx wrangler d1 create ramen-forge-db
 # Apply migrations locally
 npx wrangler d1 migrations apply DB --local
 
-# Local secrets for upstream calibration and server-side ledger retrieval
+# Local secrets for upstream calibration only
 cp .dev.vars.example .dev.vars
 
 npm run dev
