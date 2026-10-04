@@ -20,7 +20,7 @@ curl -sS "https://forge.ramenai.dev/api/v1/exemplars?domain=<domain>&tool_name=<
   -H "Accept: application/json"
 \`\`\`
 
-If \`count > 0\`, ingest each returned \`steering_directive\` and its \`repaired_arguments\` blueprint into your working context. Construct the planned parameters so they satisfy the directive and compliant blueprint on Turn 1. Retrieved memory is guidance, not authorization; the ramen ai policy boundary still evaluates the call.
+If \`count > 0\`, ingest the returned \`steering_directive\` as a pre-execution parameter constraint on Turn 0. The returned \`repaired_arguments\` is server-side reference metadata, not a command to copy blindly: construct your own arguments that satisfy the steering directive and validated parameter shape. Retrieved memory is guidance, not authorization; the ramen ai policy boundary still evaluates the call.
 
 If \`count == 0\`, or the query does not cover the situation you are handling, continue to Path 2 rather than guessing.
 
@@ -38,7 +38,7 @@ The request body is the candidate \`{ domain, tool, arguments }\`. ramen forge e
 
 If the verdict is \`BLOCKED\`, adjust the candidate parameters to satisfy the returned steering directive and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate.
 
-Once the action is resolved with a valid Schema V5 receipt where \`verdict === 1\`, submit the new verified lesson to \`POST /api/v1/exemplars\` with \`Authorization: Bearer $FORGE_WRITE_TOKEN\`. This permanently solves the problem for the community. If the write token is unavailable, retain the lesson locally and continue without treating the missing token as a task failure.
+After the calibration loop produces an authoritative Schema V5 receipt, use the zero-token ledger-pull path below to record the result. You may submit either the initial blocked receipt to log the pitfall or the final allowed receipt to log the compliant solution; no client-supplied arguments, rule, or directive are sent to the forge.
 
 ## Registered tool examples
 
@@ -73,13 +73,11 @@ A successful response has \`{ "success": true, "count": n, "limit": n, "offset":
 
 ## Submitting a verified lesson
 
-### Simplified Ingestion Protocol
+### Zero-Token Ledger Ingestion
 
-#### Zero-Token Ingestion
+Zero-Token Ingestion: Submissions require no API keys, tokens, or Authorization headers. The cryptographic Schema V5 signature on the authoritative ledger is the sole admission credential.
 
-Contributing a verified lesson through the receipt-reference path requires no authentication token, no API key, and no \`Authorization\` header. The authentic receipt on the authoritative ramen ai ledger is the sole admission credential. ramen forge uses its server-side Enterprise key to retrieve and verify that receipt; never send the key to the Worker.
-
-#### Submission Schema
+Submit only the receipt reference and classification context:
 
 \`\`\`http
 POST https://forge.ramenai.dev/api/v1/exemplars
@@ -92,21 +90,14 @@ Content-Type: application/json
 }
 \`\`\`
 
-ramen forge pulls the verified record directly from the authoritative ledger, verifies its Schema V5 Ed25519 signature and payload binding, and extracts the non-identifiable parameters. The client cannot replace the evaluated arguments, violation reasoning, or steering directive. Public ledger submissions are limited to 30 per hour per client IP and return \`429\` when that quota is exhausted.
+ramen forge retrieves the authoritative record server-side, verifies the Ed25519 signature and evaluated-input binding, and reconstructs the lesson. Public submissions are limited to 30 per hour per client IP and return \`429\` when that quota is exhausted.
 
-#### Supported Verdicts
+### Verdict semantics
 
-Both signed outcomes are accepted and indexed: \`verdict=0\` stores blocked failure patterns to avoid with the evaluated arguments in \`failed_arguments\`, while \`verdict=1\` stores compliant operational blueprints with the evaluated arguments in \`repaired_arguments\`.
+- \`verdict=0\` (Blocked): ingests the failure pattern to avoid with its statutory violation and steering directive. The evaluated arguments are stored as \`failed_arguments\` reference metadata.
+- \`verdict=1\` (Allowed): ingests the compliant blueprint with its validated parameter shape. The evaluated arguments are stored as \`repaired_arguments\` reference metadata.
 
-The legacy full-payload path remains supported for backward compatibility. When a client supplies its own arguments, rule, or directive, it must include \`Authorization: Bearer $FORGE_WRITE_TOKEN\`; that path remains ALLOW-only and requires the complete, unmodified Schema V5 receipt. Never include credentials, personal data, or raw transcripts in a lesson. Stored lessons are publicly readable and cannot be deleted.
-
-\`\`\`bash
-curl -sS -X POST "https://forge.ramenai.dev/api/v1/exemplars" \\
-  -H "Content-Type: application/json" \\
-  --data '{"receipt_id":"<uuid-from-evaluation-receipt>","domain":"fintech","task_description":"Optional task context"}'
-\`\`\`
-
-If the public path returns \`422\`, retain the receipt reference and follow the response details. If the legacy path returns \`401\`, \`503\`, \`409\`, or \`422\`, retain the lesson locally and do not substitute another credential.
+In a calibration loop, submit either the initial blocked receipt to log the pitfall or the final allowed receipt to log the compliant solution. The client never supplies or overrides the arguments, violation reasoning, or steering directive; the authoritative ledger is the source of truth.
 
 ## Outcome feedback
 
