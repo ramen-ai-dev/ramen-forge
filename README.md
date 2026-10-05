@@ -54,7 +54,7 @@ curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
   --data '{"domain":"industrial_iot","tool":"dispatch_manipulation","arguments":{"force_sensor":"degraded","stop":"unavailable"}}'
 ```
 
-If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. When calibration returns an ALLOW verdict with a verified receipt, ramen forge automatically commits the compliant blueprint to the community commons in the background before the response is sent — the response includes `"auto_ingested": true` to confirm it, and no separate call to `POST /api/v1/exemplars` is needed. The forge accepts strictly compliant blueprints (`verdict=1`) into the commons and never stores blocked failure patterns.
+If blocked, the same response already includes `related_exemplars` — up to 3 existing compliant blueprints for this `(domain, tool)` — and a non-blank `steering_directive`, so there is no need for a separate `GET /api/v1/exemplars` call to find precedent before retrying. Adjust the candidate parameters to satisfy the directive and calibrate again. When calibration returns an ALLOW verdict with a verified receipt, ramen forge automatically commits the compliant blueprint to the community commons in the background before the response is sent — the response includes `"auto_ingested": true` to confirm it, and no separate call to `POST /api/v1/exemplars` is needed. The forge accepts strictly compliant blueprints (`verdict=1`) into the commons and never stores blocked failure patterns.
 
 ## Memory taxonomy
 
@@ -169,9 +169,11 @@ An optional `task_description` string (≤ 2000 characters) may be included; it 
 | `industrial_iot`, `robotics` | `ramen__industrial_iot_actuation_invariance` |
 | `devsecops` | `ramen__shield_core_it` |
 
-Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), `evaluated_input` (the exact string the receipt's `payload_hash` covers), and `auto_ingested`.
+Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), `evaluated_input` (the exact string the receipt's `payload_hash` covers), `auto_ingested`, and `related_exemplars`.
 
 **Automatic ingestion on ALLOW.** When `allowed` is `true` and the receipt verifies, the Worker commits the compliant blueprint — `domain`, `tool`, the candidate `arguments`, the authoritative `steering_directive` and statutory anchor, and the verified receipt — to the `exemplars` table in the background via `c.executionCtx.waitUntil(...)`, through the same validation and immutability-locked upsert that `POST /api/v1/exemplars` uses. The response carries `auto_ingested: true` once this write has been scheduled. No separate call to `POST /api/v1/exemplars` is required or expected from the calling agent. An allowed verdict with an empty `arguments` object is not ingested (nothing to apply), and `auto_ingested` is `false` in that case, matching the `MISSING_COMPLIANT_ARGUMENTS` bar on the manual endpoint. A `BLOCK` verdict is never ingested.
+
+**Related precedent on BLOCK.** When `allowed` is `false`, `steering_directive` is never left blank: it falls back from upstream recovery instructions, to the violation reasoning, to a generic retry instruction, in that order, so there is always something actionable to work from. The response also carries `related_exemplars`: up to 3 existing compliant blueprints already stored for the same `(domain, tool)`, newest first, in the same shape `GET /api/v1/exemplars` returns (`[]` if none exist yet, and always `[]` on an ALLOW verdict). This spares the agent a second round trip to `GET /api/v1/exemplars` just to find a parameter shape to retry with.
 
 Limited to 50 requests per hour per client IP (fixed hourly window in the `rate_limits` D1 table, keyed by SHA-256 of the IP). Every attempt counts, including rejected bodies. Responses carry `RateLimit-*` headers; over the limit returns `429` with `Retry-After`.
 

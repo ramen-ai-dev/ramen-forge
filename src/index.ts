@@ -237,6 +237,38 @@ async function logDemand(db: D1Database, ip: string, domain: string, toolName: s
   }
 }
 
+const MAX_RELATED_EXEMPLARS = 3;
+
+/**
+ * On a BLOCK verdict, look up existing compliant blueprints for the same
+ * (domain, tool_name) so the agent can adjust its candidate arguments using
+ * concrete precedent instead of guessing — without making a second,
+ * separate GET /api/v1/exemplars call itself. These rows are always
+ * verdict=1 blueprints (COMPLIANT_BLUEPRINTS_ONLY keeps verdict=0 out of
+ * storage entirely), so there is nothing to filter out.
+ *
+ * Read-only and best-effort: a lookup failure must not turn a successful
+ * calibration into an error response, so failures are logged and an empty
+ * list is returned.
+ */
+async function fetchRelatedExemplars(
+  db: D1Database,
+  domain: string,
+  toolName: string,
+  limit: number = MAX_RELATED_EXEMPLARS,
+): Promise<CorrectionExemplarRecord[]> {
+  try {
+    const { results } = await db
+      .prepare("SELECT * FROM exemplars WHERE domain = ? AND tool_name = ? ORDER BY created_at DESC LIMIT ?")
+      .bind(domain, toolName, limit)
+      .all<ExemplarRow>();
+    return results.map(toRecord);
+  } catch (error) {
+    console.error("ramen-forge related exemplar lookup failed", error);
+    return [];
+  }
+}
+
 /** Map a D1 row back to foundry's CorrectionExemplar.to_dict() field names. */
 function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
   const compliantArguments = parseStoredObject(row.repaired_arguments_json);
@@ -744,7 +776,14 @@ app.post("/api/v1/calibrate", async (c) => {
     }
   }
 
-  return c.json({ ...outcome.body, auto_ingested: willAutoIngest });
+  // On BLOCK, hand the agent concrete compliant precedent for this exact (domain, tool_name)
+  // inline in the same response, rather than requiring it to make a second
+  // GET /api/v1/exemplars round trip just to find the parameter shape it should retry with.
+  const relatedExemplars = outcome.body.allowed
+    ? []
+    : await fetchRelatedExemplars(c.env.DB, request.value.domain, request.value.tool);
+
+  return c.json({ ...outcome.body, auto_ingested: willAutoIngest, related_exemplars: relatedExemplars });
 });
 
 app.notFound((c) => c.json({ success: false, error: "not found" }, 404));

@@ -209,6 +209,21 @@ export async function evaluateCalibration(
   for (const v of data.total_violations ?? []) if (v.recovery_instruction) steering.push(v.recovery_instruction);
   for (const r of data.results ?? []) if (r.instruction) steering.push(r.instruction);
 
+  // A BLOCK verdict with no recovery_instruction/instruction from upstream would otherwise
+  // leave the agent with steering_directive: null and nothing actionable to retry with. Fall
+  // back to the violation reasoning, then to a generic retry instruction, so a BLOCK always
+  // carries guidance and the agent is never left to guess what to fix.
+  let steeringDirective: string | null = steering.length > 0 ? steering.join(" | ") : null;
+  if (!steeringDirective && !data.allowed) {
+    const reasons = (data.total_violations ?? [])
+      .map((v) => v.reasoning)
+      .filter((reason): reason is string => Boolean(reason && reason.trim() !== ""));
+    steeringDirective =
+      reasons.length > 0
+        ? reasons.join(" | ")
+        : "Blocked: adjust the candidate arguments to satisfy the evaluated policy and call /api/v1/calibrate again.";
+  }
+
   const receipt = data.receipt ?? null;
   let receiptVerified = false;
   let receiptReason: string | null = "no receipt returned";
@@ -226,7 +241,7 @@ export async function evaluateCalibration(
       bundle_id: bundleId,
       allowed: data.allowed,
       verdict: data.allowed ? "ALLOW" : "BLOCK",
-      steering_directive: steering.length > 0 ? steering.join(" | ") : null,
+      steering_directive: steeringDirective,
       statutory_anchors: data.statutory_anchors ?? receipt?.statutory_anchors ?? [],
       policy_ids: data.policy_ids ?? [],
       violations: (data.total_violations ?? []).map((v) => ({

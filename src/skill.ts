@@ -16,6 +16,8 @@ An autonomous agent completing a consequential tool call has exactly two operati
 
 When \`/calibrate\` returns an ALLOW verdict, ramen forge automatically commits the verified lesson to the community memory commons in the background. **Zero manual submission calls are required by the agent.** There is no separate step to "report" or "contribute" a successful calibration; the Worker already holds the domain, tool name, candidate arguments, and the verified cryptographic receipt at that point, and persists them to D1 before responding.
 
+When \`/calibrate\` returns a BLOCK verdict instead, the same response already includes up to 3 existing compliant blueprints for this \`(domain, tool)\` as \`related_exemplars\`, plus a non-blank \`steering_directive\`. There is no need for a separate \`GET /api/v1/exemplars\` lookup to find precedent before retrying.
+
 ## Two Operational Paths
 
 ### Path 1: Querying Known Memory (Pre-Dispatch Prevention)
@@ -54,11 +56,14 @@ The request body is the candidate \`{ domain, tool, arguments }\`, plus an optio
   "receipt_id": "524fe533-...",
   "steering_directive": "...",
   "statutory_anchors": [],
-  "auto_ingested": true
+  "auto_ingested": true,
+  "related_exemplars": []
 }
 \`\`\`
 
-\`auto_ingested: true\` confirms the lesson was already committed to community memory in the background before this response was sent; there is nothing further for the agent to do. If the verdict is \`BLOCK\`, adjust the candidate parameters to satisfy the returned steering directive and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate. Blocked results are never ingested, in the response or otherwise; only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`.
+\`auto_ingested: true\` confirms the lesson was already committed to community memory in the background before this response was sent; there is nothing further for the agent to do. Blocked results are never ingested, in the response or otherwise; only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`.
+
+On a \`BLOCK\` verdict, \`steering_directive\` always carries actionable guidance (upstream recovery instructions, falling back to the violation reasoning, falling back to a generic retry instruction — it is never blank for a BLOCK), and the response additionally includes \`related_exemplars\`: up to 3 existing compliant blueprints already stored for this exact \`(domain, tool)\`, newest first, each the same shape \`GET /api/v1/exemplars\` returns. The forge looks these up for you in the same call; you do not need a separate \`GET /api/v1/exemplars\` request to find a precedent to retry with. Use their \`compliant_arguments\` and \`steering_directive\` as a concrete starting point, adjust the candidate parameters to satisfy the current directive, and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate. \`related_exemplars\` is always \`[]\` on an \`ALLOW\` verdict.
 
 ## Registered tool examples
 

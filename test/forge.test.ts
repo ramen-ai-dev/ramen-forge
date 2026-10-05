@@ -132,6 +132,15 @@ function createDb(rows: ExemplarRow[]) {
               ] as T[],
             };
           }
+          // fetchRelatedExemplars: "WHERE domain = ? AND tool_name = ? ... LIMIT ?", no
+          // LIKE/GROUP BY, offset, or other filters -- a shape distinct enough to special-case.
+          if (sql.includes("domain = ?") && sql.includes("tool_name = ?") && !sql.includes("LIKE ?") && !sql.includes("task_fingerprint")) {
+            const [domainBind, toolNameBind, limitBind] = binds as [string, string, number];
+            const selected = rows
+              .filter((row) => row.domain === domainBind && row.tool_name === toolNameBind)
+              .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+            return { results: selected.slice(0, Number(limitBind ?? 10)) as T[] };
+          }
           let selected = [...rows];
           if (sql.includes("LIKE ?")) {
             const pattern = String(binds.find((value) => typeof value === "string" && value.startsWith("%")) ?? "");
@@ -708,6 +717,194 @@ describe("automatic ingestion on successful calibration", () => {
     expect(body.allowed).toBe(true);
     expect(body.auto_ingested).toBe(false);
     expect(rows).toHaveLength(0);
+  });
+
+  it("returns [] for related_exemplars on an ALLOW verdict even when precedent exists", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const candidateArguments = { robot_id: "ROBOHARM-ARM-01", commanded_velocity_mps: 0.05 };
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
+    stubUpstreamFetch(await upstreamEvaluateResponse(input, 1));
+
+    const existingBlueprint = makeRow({
+      domain: "industrial_iot",
+      tool_name: "dispatch_manipulation",
+      repaired_arguments_json: JSON.stringify({ robot_id: "ROBOHARM-ARM-02" }),
+    });
+    const { db } = createDb([existingBlueprint]);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: candidateArguments }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).related_exemplars).toEqual([]);
+  });
+});
+
+describe("compliant precedent and guidance on a BLOCK verdict", () => {
+  const calibrateReceiptId = "55555555-5555-4555-8555-555555555555";
+
+  async function upstreamBlockResponse(input: string, overrides: Record<string, unknown> = {}) {
+    const payloadHash = await sha256Hex(input);
+    const canonicalPayload = JSON.stringify({
+      schema_version: "5.0",
+      kid: "ramen_pk_v1",
+      id: calibrateReceiptId,
+      verdict: 0,
+      payload_hash: payloadHash,
+      policy_ids: ["industrial_iot_actuation_invariance"],
+    });
+    return {
+      data: {
+        allowed: false,
+        policy_ids: ["industrial_iot_actuation_invariance"],
+        policies_evaluated: 1,
+        policies_passed: 0,
+        policies_failed: 1,
+        policies_errored: 0,
+        total_violations: [],
+        results: [],
+        execution_time_ms: 1,
+        executed_at: new Date().toISOString(),
+        statutory_anchors: ["ISO 10218-1:2025"],
+        receipt: {
+          id: calibrateReceiptId,
+          schema_version: "5.0",
+          kid: "ramen_pk_v1",
+          signature: btoa("\u0000".repeat(64)),
+          canonical_payload: canonicalPayload,
+        },
+        ...overrides,
+      },
+    };
+  }
+
+  function stubUpstreamFetch(responseBody: unknown) {
+    return vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify(responseBody), { status: 200, headers: { "Content-Type": "application/json" } })),
+    );
+  }
+
+  it("includes up to 3 existing compliant blueprints for the same (domain, tool) as related_exemplars", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const candidateArguments = { force_sensor: "degraded", stop: "unavailable" };
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
+    stubUpstreamFetch(await upstreamBlockResponse(input));
+
+    const blueprints = [
+      makeRow({
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        domain: "industrial_iot",
+        tool_name: "dispatch_manipulation",
+        created_at: "2026-10-01T00:00:00.000Z",
+        repaired_arguments_json: JSON.stringify({ robot_id: "ROBOHARM-ARM-01" }),
+      }),
+      makeRow({
+        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        domain: "industrial_iot",
+        tool_name: "dispatch_manipulation",
+        created_at: "2026-10-02T00:00:00.000Z",
+        repaired_arguments_json: JSON.stringify({ robot_id: "ROBOHARM-ARM-02" }),
+      }),
+      // Different tool_name: must not leak into dispatch_manipulation's related_exemplars.
+      makeRow({ id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", domain: "industrial_iot", tool_name: "set_robot_tcp_speed" }),
+    ];
+    const { db } = createDb(blueprints);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: candidateArguments }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.allowed).toBe(false);
+    expect(body.related_exemplars).toHaveLength(2);
+    // Newest first.
+    expect(body.related_exemplars[0].id).toBe("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    expect(body.related_exemplars[0].compliant_arguments).toEqual({ robot_id: "ROBOHARM-ARM-02" });
+    expect(body.related_exemplars[1].id).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  });
+
+  it("returns an empty related_exemplars array when no precedent exists for this (domain, tool)", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const candidateArguments = { force_sensor: "degraded" };
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
+    stubUpstreamFetch(await upstreamBlockResponse(input));
+
+    const { db } = createDb([]);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: candidateArguments }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).related_exemplars).toEqual([]);
+  });
+
+  it("falls back to violation reasoning, then a generic retry instruction, when upstream gives no recovery_instruction", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const candidateArguments = { force_sensor: "degraded" };
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
+
+    // No recovery_instruction/instruction anywhere, but a violation reasoning string exists.
+    stubUpstreamFetch(
+      await upstreamBlockResponse(input, {
+        total_violations: [{ rule_id: "r1", rule_name: "force-sensor-health", reasoning: "Force sensor reports degraded state." }],
+      }),
+    );
+    const { db } = createDb([]);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: candidateArguments }),
+      },
+      env,
+    );
+
+    const body = await response.json();
+    expect(body.steering_directive).toBe("Force sensor reports degraded state.");
+
+    // Now with no reasoning either: must fall back to the generic retry instruction,
+    // never leaving steering_directive null/blank on a BLOCK.
+    stubUpstreamFetch(await upstreamBlockResponse(input));
+    const response2 = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: candidateArguments }),
+      },
+      env,
+    );
+    const body2 = await response2.json();
+    expect(body2.steering_directive).toBeTruthy();
+    expect(typeof body2.steering_directive).toBe("string");
   });
 });
 
