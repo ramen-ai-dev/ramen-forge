@@ -14,6 +14,8 @@ export interface CalibrateRequest {
   domain: string;
   tool: string;
   arguments: JsonObject;
+  /** Optional: feeds the auto-ingested lesson's task_description on an ALLOW verdict. */
+  task_description?: string;
 }
 
 export type JsonObject = { [key: string]: JsonValue };

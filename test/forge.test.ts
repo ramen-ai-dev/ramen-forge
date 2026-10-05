@@ -145,9 +145,21 @@ function createDb(rows: ExemplarRow[]) {
           return { results: selected.slice(offset, offset + limit) as T[] };
         },
         async first<T>() {
+          // calibrate's global-ceiling check and slot reservation both go through
+          // .first(), not .batch(). Keep them non-blocking in the mock so the
+          // calibrate handler reaches evaluateCalibration() during tests.
+          if (sql.includes("global_count")) return { global_count: 0 } as T;
+          if (sql.includes("RETURNING request_count")) return { request_count: 1 } as T;
           return null as T | null;
         },
         async run() {
+          // autoIngestCompliantBlueprint writes with a single .run(), not a .batch();
+          // mirror the real UPSERT_SQL's enrichment/lock semantics so assertions on
+          // `rows` after a calibrate call see the same effect a real upsert would have.
+          if (sql.includes("ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule)")) {
+            enrichedExemplarUpsert(rows, binds);
+            return { meta: { changes: 1 } };
+          }
           return { meta: { changes: 0 } };
         },
       };
@@ -548,6 +560,154 @@ describe("enrichment upsert and immutability lock", () => {
     // thinner resubmission's generic server-derived placeholders.
     expect(richRow.primary_statutory_anchor).toBe("UCC Article 4A, Section 4A-202");
     expect(richRow.steering_directive).toBe("Verify beneficiary sanctions clearance before release.");
+  });
+});
+
+describe("automatic ingestion on successful calibration", () => {
+  const calibrateReceiptId = "44444444-4444-4444-8444-444444444444";
+
+  /** Builds an upstream /calibrate response whose receipt.payload_hash matches `input`. */
+  async function upstreamEvaluateResponse(input: string, verdict: 0 | 1, extra: Record<string, unknown> = {}) {
+    const payloadHash = await sha256Hex(input);
+    const canonicalPayload = JSON.stringify({
+      schema_version: "5.0",
+      kid: "ramen_pk_v1",
+      id: calibrateReceiptId,
+      verdict,
+      payload_hash: payloadHash,
+      policy_ids: ["industrial_iot_actuation_invariance"],
+    });
+    return {
+      data: {
+        allowed: verdict === 1,
+        policy_ids: ["industrial_iot_actuation_invariance"],
+        policies_evaluated: 1,
+        policies_passed: verdict === 1 ? 1 : 0,
+        policies_failed: verdict === 1 ? 0 : 1,
+        policies_errored: 0,
+        total_violations: [],
+        results: [],
+        execution_time_ms: 1,
+        executed_at: new Date().toISOString(),
+        statutory_anchors: ["ISO 10218-1:2025"],
+        receipt: {
+          id: calibrateReceiptId,
+          schema_version: "5.0",
+          kid: "ramen_pk_v1",
+          signature: btoa("\u0000".repeat(64)),
+          canonical_payload: canonicalPayload,
+        },
+        ...extra,
+      },
+    };
+  }
+
+  function stubUpstreamFetch(responseBody: unknown) {
+    return vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify(responseBody), { status: 200, headers: { "Content-Type": "application/json" } })),
+    );
+  }
+
+  it("auto-ingests the compliant blueprint into D1 with populated arguments and signature on an ALLOW verdict", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const candidateArguments = {
+      robot_id: "ROBOHARM-ARM-01",
+      action_type: "PICK_AND_PLACE",
+      target_object: "identified molten-metal crucible",
+      commanded_velocity_mps: 0.05,
+    };
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
+    stubUpstreamFetch(await upstreamEvaluateResponse(input, 1));
+
+    const rows: ExemplarRow[] = [];
+    const { db } = createDb(rows);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          domain: "industrial_iot",
+          tool: "dispatch_manipulation",
+          arguments: candidateArguments,
+          task_description: "Supervised handling of identified molten-metal crucible",
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    expect(body.allowed).toBe(true);
+    expect(body.auto_ingested).toBe(true);
+
+    // The background write is awaited inline in tests (no real ExecutionContext),
+    // so the row is already committed by the time the response is checked.
+    expect(rows).toHaveLength(1);
+    const stored = rows[0];
+    expect(stored.domain).toBe("industrial_iot");
+    expect(stored.tool_name).toBe("dispatch_manipulation");
+    expect(JSON.parse(stored.repaired_arguments_json)).toEqual(candidateArguments);
+    expect(stored.signature).toBe(btoa("\u0000".repeat(64)));
+    expect(stored.receipt_id).toBe(calibrateReceiptId.toLowerCase());
+    expect(stored.violation_rule).toBe("No violation: compliant reference action");
+  });
+
+  it("does not auto-ingest and reports auto_ingested: false on a BLOCK verdict", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const candidateArguments = { force_sensor: "degraded", stop: "unavailable" };
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
+    stubUpstreamFetch(await upstreamEvaluateResponse(input, 0));
+
+    const rows: ExemplarRow[] = [];
+    const { db } = createDb(rows);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: candidateArguments }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.allowed).toBe(false);
+    expect(body.auto_ingested).toBe(false);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("does not auto-ingest an ALLOW verdict with an empty candidate arguments object", async () => {
+    vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+    const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: {} });
+    stubUpstreamFetch(await upstreamEvaluateResponse(input, 1));
+
+    const rows: ExemplarRow[] = [];
+    const { db } = createDb(rows);
+    const env: Env = { DB: db, RAMEN_API_KEY: "test-api-key", RAMEN_GATEWAY_URL: "https://gateway.example.test" };
+
+    const response = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: {} }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.allowed).toBe(true);
+    expect(body.auto_ingested).toBe(false);
+    expect(rows).toHaveLength(0);
   });
 });
 

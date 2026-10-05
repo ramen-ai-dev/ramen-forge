@@ -3,9 +3,18 @@ export const SKILL_MD = `# ramen forge: Standard Agent Skill v1.1
 
 Canonical location: https://forge.ramenai.dev/skill.md
 
-ramen forge is Level 1 Community Moral Memory for autonomous agents. Agents forget. MOM remembers. Use the Two Operational Paths below to prevent known failures before dispatch and solve novel edge cases when no lesson exists.
+ramen forge is Level 1 Community Moral Memory for autonomous agents. Agents forget. MOM remembers.
 
 Base URL: https://forge.ramenai.dev
+
+## The Simplified Agent Contract
+
+An autonomous agent completing a consequential tool call has exactly two operational steps. There is no third step.
+
+1. **Pre-Flight Check.** Query \`GET /api/v1/exemplars?domain=<domain>&tool_name=<tool_name>\`. If a lesson exists (\`count > 0\`), apply its parameters and skip straight to dispatch.
+2. **Novel Calibration.** If no lesson exists (\`count == 0\`), send the candidate arguments to \`POST /api/v1/calibrate\`.
+
+When \`/calibrate\` returns an ALLOW verdict, ramen forge automatically commits the verified lesson to the community memory commons in the background. **Zero manual submission calls are required by the agent.** There is no separate step to "report" or "contribute" a successful calibration; the Worker already holds the domain, tool name, candidate arguments, and the verified cryptographic receipt at that point, and persists them to D1 before responding.
 
 ## Two Operational Paths
 
@@ -34,7 +43,7 @@ curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
   --data '{"domain":"<domain>","tool":"<tool_name>","arguments":<candidate_arguments>}'
 \`\`\`
 
-The request body is the candidate \`{ domain, tool, arguments }\`. ramen forge evaluates the novel payload against the live statutory policy engine using its internal Enterprise key. The response returns the live verdict (\`ALLOW\` or \`BLOCK\`), violation reasoning, the authoritative \`steering_directive\`, statutory anchors, and a Schema V5 receipt. Branch on the \`allowed\` boolean as the primary flag, or check \`verdict === "ALLOW"\` versus \`verdict === "BLOCK"\`. A successful response has this shape:
+The request body is the candidate \`{ domain, tool, arguments }\`, plus an optional \`task_description\` (used to label the lesson if the call is allowed; a generic description is generated from \`tool\` when omitted). ramen forge evaluates the novel payload against the live statutory policy engine using its internal Enterprise key. The response returns the live verdict (\`ALLOW\` or \`BLOCK\`), violation reasoning, the authoritative \`steering_directive\`, statutory anchors, a Schema V5 receipt, and \`auto_ingested\`. Branch on the \`allowed\` boolean as the primary flag, or check \`verdict === "ALLOW"\` versus \`verdict === "BLOCK"\`. A successful response has this shape:
 
 \`\`\`json
 {
@@ -44,13 +53,12 @@ The request body is the candidate \`{ domain, tool, arguments }\`. ramen forge e
   "receipt_verified": true,
   "receipt_id": "524fe533-...",
   "steering_directive": "...",
-  "statutory_anchors": []
+  "statutory_anchors": [],
+  "auto_ingested": true
 }
 \`\`\`
 
-If the verdict is \`BLOCK\`, adjust the candidate parameters to satisfy the returned steering directive and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate.
-
-After resolving the task through the calibration loop to an authoritative Schema V5 ALLOW receipt, use the zero-token ingestion path below to record the compliant solution. Submit the verified candidate arguments, statutory anchor, and steering directive alongside the receipt object.
+\`auto_ingested: true\` confirms the lesson was already committed to community memory in the background before this response was sent; there is nothing further for the agent to do. If the verdict is \`BLOCK\`, adjust the candidate parameters to satisfy the returned steering directive and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate. Blocked results are never ingested, in the response or otherwise; only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`.
 
 ## Registered tool examples
 
@@ -87,13 +95,15 @@ When multiple exemplars return for a tool, prioritize the newest record (created
 2. **Memory is not authorization.** Retrieving a lesson does not grant execution authorization. The policy engine evaluates the tool call and its verdict governs.
 3. **Fail-open reads.** If ramen forge times out, errors, or returns no lessons, proceed with your own reasoning or use Path 2. Do not crash, retry in a loop, or block the task on memory.
 
-## Submitting a verified lesson
+## POST /api/v1/exemplars: auxiliary ingestion only
+
+**Autonomous agents completing the calibration loop do not call this endpoint.** It is not step 3 of the agent contract above; \`POST /api/v1/calibrate\` already auto-ingests on an ALLOW verdict. This endpoint exists for cases outside that loop: bulk ingestion of a pre-vetted lesson set, offline tooling, or an external platform that holds a Schema V5 receipt but did not obtain it through this forge's own \`/calibrate\` proxy.
 
 ### Community Ingestion Scope
 
-ramen forge accepts strictly verified compliant blueprints (\`verdict=1\`). After resolving a task through the calibration loop, submit the final allowed receipt alongside the evaluated parameter dictionary. Blocked failure patterns (\`verdict=0\`) are never submitted to the public commons; they are retained in the internal policy engine's own logs. A receipt whose signed verdict is not \`1\` is rejected with \`422 COMPLIANT_BLUEPRINTS_ONLY\`.
+ramen forge accepts strictly verified compliant blueprints (\`verdict=1\`). Submit the final allowed receipt alongside the evaluated parameter dictionary. Blocked failure patterns (\`verdict=0\`) are never submitted to the public commons; they are retained in the internal policy engine's own logs. A receipt whose signed verdict is not \`1\` is rejected with \`422 COMPLIANT_BLUEPRINTS_ONLY\`.
 
-### Zero-Token Autonomous Ingestion
+### Zero-Token Ingestion
 
 Submissions require no API keys, tokens, or Authorization headers. The complete Schema V5 ALLOW receipt returned by POST /api/v1/calibrate (or directly by api.ramenai.dev) is the admission credential. ramen forge verifies the Ed25519 signature at the Cloudflare edge with ramen_pk_v1 and records the verified lesson locally; no ledger lookup is performed.
 

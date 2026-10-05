@@ -19,11 +19,12 @@ import {
   reserveGlobalSlot,
   resolveEvaluateUrl,
   secondsUntilNextHour,
+  type CalibrateOutcome,
 } from "./calibrate";
 import { renderConsole } from "./console";
 import { INVALID_RECEIPT_CODE, INVALID_RECEIPT_MESSAGE, verifyExemplarReceipt } from "./receipt";
 import { SKILL_MD } from "./skill";
-import type { CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
+import type { CalibrateRequest, CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
 import {
   MAX_BODY_BYTES,
   MAX_CALIBRATE_BODY_BYTES,
@@ -141,6 +142,79 @@ function bindExemplar(db: D1Database, exemplar: CorrectionExemplarInput, receipt
       receipt.signature,
       receipt.canonicalPayload,
     );
+}
+
+/**
+ * Same bar as MISSING_COMPLIANT_ARGUMENTS on the manual ingestion path: an
+ * allowed verdict with an empty candidate dictionary has nothing to apply and
+ * is not auto-ingested. Shared by the response flag and the background job so
+ * `auto_ingested` in the response always matches whether the write is attempted.
+ */
+function isAutoIngestEligible(request: CalibrateRequest, outcome: Extract<CalibrateOutcome, { ok: true }>["body"]): boolean {
+  return outcome.allowed && outcome.receipt !== null && outcome.receipt_verified && Object.keys(request.arguments).length > 0;
+}
+
+/**
+ * Automatically commit a verified ALLOW calibration result to the community
+ * commons, so an autonomous agent that resolves a novel case through
+ * POST /api/v1/calibrate never has to make a separate manual call to
+ * POST /api/v1/exemplars to share it.
+ *
+ * Routed through the same `validateExemplar` the manual endpoint uses (control
+ * character / size limits, credential-shape scanning, required-field checks)
+ * and the same immutability-locked UPSERT_SQL (via bindExemplar): calibrate's
+ * `arguments` is attacker-controlled input flowing straight into public memory
+ * with no human or agent review step in between, so it must clear exactly the
+ * same bar a manual submission would, and a second verified receipt for the
+ * same invariant still cannot overwrite an already-populated row.
+ *
+ * Never throws: a failure here must not turn a successful calibration into an
+ * error response, so every failure path logs and returns.
+ */
+async function autoIngestCompliantBlueprint(
+  db: D1Database,
+  request: CalibrateRequest,
+  outcome: Extract<CalibrateOutcome, { ok: true }>["body"],
+): Promise<void> {
+  const receipt = outcome.receipt;
+  if (!isAutoIngestEligible(request, outcome) || !receipt) return;
+
+  try {
+    const taskDescription = request.task_description?.trim() || `Compliant operational blueprint for ${request.tool}`;
+    const policyId = outcome.policy_ids[0] ?? "general";
+    const primaryStatutoryAnchor = outcome.statutory_anchors[0] || `Statutory Invariant (Policy ${policyId})`;
+
+    // Lowercased once up front so exemplar_id, receipt_id, and the verifiedReceiptId
+    // argument all agree, same as receipt.ts's own receiptId normalisation.
+    const receiptId = receipt.id.toLowerCase();
+    const result = await validateExemplar(
+      {
+        exemplar_id: receiptId,
+        domain: request.domain,
+        task_description: taskDescription,
+        tool_name: request.tool,
+        failed_arguments: {},
+        violation_reason: "No violation: compliant reference action",
+        primary_statutory_anchor: primaryStatutoryAnchor,
+        steering_directive: outcome.steering_directive || "Compliant operational blueprint",
+        compliant_arguments: request.arguments,
+        receipt_id: receiptId,
+        created_at: new Date().toISOString(),
+      },
+      receiptId,
+    );
+    if (!result.ok) {
+      console.error("ramen-forge auto-ingestion skipped: exemplar failed validation", result.errors);
+      return;
+    }
+
+    await bindExemplar(db, result.value, { signature: receipt.signature, canonicalPayload: receipt.canonical_payload }).run();
+    console.log(
+      `ramen-forge auto-ingested compliant blueprint ${result.value.exemplar_id} into community memory (${request.domain}/${request.tool})`,
+    );
+  } catch (error) {
+    console.error("ramen-forge auto-ingestion failed", error);
+  }
 }
 
 /**
@@ -648,7 +722,29 @@ app.post("/api/v1/calibrate", async (c) => {
       outcome.status,
     );
   }
-  return c.json(outcome.body);
+
+  // An ALLOW verdict with a verified receipt is committed to the community commons
+  // automatically, so the agent never has to make a separate POST /api/v1/exemplars
+  // call to share the compliant blueprint it just resolved.
+  const willAutoIngest = isAutoIngestEligible(request.value, outcome.body);
+  if (willAutoIngest) {
+    const ingest = autoIngestCompliantBlueprint(c.env.DB, request.value, outcome.body);
+    // c.executionCtx throws (not just returns undefined) when the Worker was invoked
+    // without a FetchEvent/ExecutionContext, e.g. in unit tests calling app.request()
+    // directly. Same defensive pattern as logDemand's scheduling above.
+    try {
+      const executionContext = c.executionCtx;
+      if (typeof executionContext.waitUntil === "function") {
+        executionContext.waitUntil(ingest);
+      } else {
+        await ingest;
+      }
+    } catch {
+      await ingest;
+    }
+  }
+
+  return c.json({ ...outcome.body, auto_ingested: willAutoIngest });
 });
 
 app.notFound((c) => c.json({ success: false, error: "not found" }, 404));

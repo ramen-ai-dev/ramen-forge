@@ -298,7 +298,8 @@ export function toLikePattern(term: string): string {
 }
 
 export const MAX_CALIBRATE_BODY_BYTES = MAX_ARGUMENTS_BYTES + 1024;
-const CALIBRATE_KEYS = new Set(["domain", "tool", "arguments"]);
+const CALIBRATE_KEYS = new Set(["domain", "tool", "arguments", "task_description"]);
+const MAX_CALIBRATE_TASK_DESCRIPTION = 2000;
 
 /** Validate the untrusted body of POST /api/v1/calibrate. Domain-to-bundle mapping is the caller's job. */
 export function validateCalibrateRequest(
@@ -318,6 +319,18 @@ export function validateCalibrateRequest(
   }
   const args = checkArguments(payload.arguments, "arguments", errors, []);
 
+  // Optional: feeds the lesson auto-ingested to the community commons on an ALLOW
+  // verdict. Omitted entirely is fine; the ingestion path falls back to a generated
+  // description built from the tool name.
+  let taskDescription: string | undefined;
+  if (payload.task_description !== undefined) {
+    const value = checkText(payload.task_description, "task_description", MAX_CALIBRATE_TASK_DESCRIPTION, errors);
+    if (value !== null) taskDescription = value;
+  }
+
   if (errors.length > 0 || args === null) return { ok: false, errors };
-  return { ok: true, value: { domain: domain as string, tool: tool as string, arguments: args } };
+  return {
+    ok: true,
+    value: { domain: domain as string, tool: tool as string, arguments: args, ...(taskDescription !== undefined ? { task_description: taskDescription } : {}) },
+  };
 }

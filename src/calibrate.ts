@@ -149,6 +149,8 @@ export type CalibrateOutcome =
         verdict: "ALLOW" | "BLOCK";
         steering_directive: string | null;
         statutory_anchors: string[];
+        /** Upstream policy bundle ids evaluated, for the auto-ingestion anchor fallback. */
+        policy_ids: string[];
         violations: { rule_id: string; rule_name: string; reasoning: string | null; recovery_instruction: string | null }[];
         receipt: RamenReceipt | null;
         receipt_id: string | null;
@@ -226,6 +228,7 @@ export async function evaluateCalibration(
       verdict: data.allowed ? "ALLOW" : "BLOCK",
       steering_directive: steering.length > 0 ? steering.join(" | ") : null,
       statutory_anchors: data.statutory_anchors ?? receipt?.statutory_anchors ?? [],
+      policy_ids: data.policy_ids ?? [],
       violations: (data.total_violations ?? []).map((v) => ({
         rule_id: v.rule_id,
         rule_name: v.rule_name,

@@ -26,7 +26,7 @@ ramen forge is the Level 1 Community Moral Memory (MOM) Engine for autonomous ag
 2. ramen forge returns the relevant statutory invariant and compliant parameter blueprint.
 3. The agent ingests the directive into its working instructions, constructing a compliant tool call on its first attempt.
 4. The stateless ramen ai execution boundary evaluates the call pre-dispatch, releases execution, and mints an unalterable Schema V5 Ed25519 receipt.
-5. If a novel operational edge case is evaluated and allowed, the verified lesson can be contributed to ramen forge (Level 1) to protect other agents across the network.
+5. If a novel operational edge case is evaluated and allowed via `POST /api/v1/calibrate`, ramen forge automatically commits the verified lesson to ramen forge (Level 1) in the background to protect other agents across the network — no separate submission call is required.
 
 ramen ai remains strictly stateless. Memory lives on the client (Level 0) or in ramen forge (Level 1/2), never in the policy boundary.
 
@@ -54,7 +54,7 @@ curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
   --data '{"domain":"industrial_iot","tool":"dispatch_manipulation","arguments":{"force_sensor":"degraded","stop":"unavailable"}}'
 ```
 
-If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. Once the calibration loop produces an ALLOW Schema V5 receipt, submit that complete receipt object with the lesson context and the verified compliant arguments through the public zero-token ingestion endpoint. The forge verifies the receipt locally and accepts strictly compliant blueprints (`verdict=1`); it does not perform a ledger lookup, and it never stores blocked failure patterns.
+If blocked, adjust the candidate parameters to satisfy the steering directive and calibrate again. When calibration returns an ALLOW verdict with a verified receipt, ramen forge automatically commits the compliant blueprint to the community commons in the background before the response is sent — the response includes `"auto_ingested": true` to confirm it, and no separate call to `POST /api/v1/exemplars` is needed. The forge accepts strictly compliant blueprints (`verdict=1`) into the commons and never stores blocked failure patterns.
 
 ## Memory taxonomy
 
@@ -68,9 +68,11 @@ If blocked, adjust the candidate parameters to satisfy the steering directive an
 
 Records use the same field names as ramen foundry's `CorrectionExemplar.to_dict()`, plus `domain` and `task_description`. In D1, `exemplar_id` is stored as `id`, `violation_reason` as `violation_rule`, and argument objects as `*_json` text columns.
 
-### `POST /api/v1/exemplars` (public local verification)
+### `POST /api/v1/exemplars` (auxiliary ingestion, public local verification)
 
-Submits the complete Schema V5 receipt returned by calibration without authentication. The Worker verifies the Ed25519 signature locally with the pinned `ramen_pk_v1` key, extracts the signed verdict and policy metadata, and commits the lesson to D1. No upstream ledger request is made. The community commons accepts **strictly verified compliant blueprints (`verdict=1`)**; a receipt whose signed verdict is `0` (blocked) is rejected with `422` and error code `COMPLIANT_BLUEPRINTS_ONLY`. Blocked failure patterns are retained in the internal policy engine's own logs, not advertised in public memory.
+**Autonomous agents completing the calibration loop do not need to call this endpoint.** `POST /api/v1/calibrate` already auto-ingests a compliant blueprint into D1 on an ALLOW verdict (see below). This endpoint remains for cases outside that loop: bulk ingestion of a pre-vetted lesson set, offline tooling, or an external platform that holds its own Schema V5 receipt but did not obtain it through this forge's `/calibrate` proxy.
+
+Submits the complete Schema V5 receipt without authentication. The Worker verifies the Ed25519 signature locally with the pinned `ramen_pk_v1` key, extracts the signed verdict and policy metadata, and commits the lesson to D1. No upstream ledger request is made. The community commons accepts **strictly verified compliant blueprints (`verdict=1`)**; a receipt whose signed verdict is `0` (blocked) is rejected with `422` and error code `COMPLIANT_BLUEPRINTS_ONLY`. Blocked failure patterns are retained in the internal policy engine's own logs, not advertised in public memory.
 
 ```http
 POST https://forge.ramenai.dev/api/v1/exemplars
@@ -159,13 +161,17 @@ Community calibration proxy. Evaluates one tool call against the ramen-ai policy
 { "domain": "devsecops", "tool": "run_bash", "arguments": { "command": "rm -rf /" } }
 ```
 
+An optional `task_description` string (≤ 2000 characters) may be included; it labels the auto-ingested lesson if the call evaluates as allowed, and is otherwise unused. When omitted, a generic description is generated from `tool`.
+
 | Domain | Bundle |
 | --- | --- |
 | `fintech` | `ramen__fintech_banking_invariance` |
 | `industrial_iot`, `robotics` | `ramen__industrial_iot_actuation_invariance` |
 | `devsecops` | `ramen__shield_core_it` |
 
-Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), and `evaluated_input` (the exact string the receipt's `payload_hash` covers).
+Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), `evaluated_input` (the exact string the receipt's `payload_hash` covers), and `auto_ingested`.
+
+**Automatic ingestion on ALLOW.** When `allowed` is `true` and the receipt verifies, the Worker commits the compliant blueprint — `domain`, `tool`, the candidate `arguments`, the authoritative `steering_directive` and statutory anchor, and the verified receipt — to the `exemplars` table in the background via `c.executionCtx.waitUntil(...)`, through the same validation and immutability-locked upsert that `POST /api/v1/exemplars` uses. The response carries `auto_ingested: true` once this write has been scheduled. No separate call to `POST /api/v1/exemplars` is required or expected from the calling agent. An allowed verdict with an empty `arguments` object is not ingested (nothing to apply), and `auto_ingested` is `false` in that case, matching the `MISSING_COMPLIANT_ARGUMENTS` bar on the manual endpoint. A `BLOCK` verdict is never ingested.
 
 Limited to 50 requests per hour per client IP (fixed hourly window in the `rate_limits` D1 table, keyed by SHA-256 of the IP). Every attempt counts, including rejected bodies. Responses carry `RateLimit-*` headers; over the limit returns `429` with `Retry-After`.
 
