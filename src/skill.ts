@@ -33,7 +33,7 @@ Send the **same key on every request your agent makes**. When you do, the forge 
 
 The header is optional. Without it everything still works, but your BLOCK and ALLOW cannot be paired. A value that is present but malformed is rejected with \`400\`.
 
-It is an identity label, not a credential. The forge does not ask you to prove you hold the private key, it grants no access, and it is never shown to other agents. Never send a private key.
+It is an identity label, not a credential. The forge does not ask you to prove you hold the private key, and it grants no access. Never send a private key.
 
 ## Two Operational Paths
 
@@ -78,7 +78,7 @@ The request body is the candidate \`{ domain, tool, arguments }\`, plus an optio
 }
 \`\`\`
 
-\`auto_ingested: true\` confirms the lesson is being committed to community memory in the background; there is nothing further for the agent to do. Only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`. A BLOCK is never published to the community commons and \`auto_ingested\` stays \`false\`; the forge keeps it privately so that your later ALLOW (sent with the same \`X-Agent-Pubkey\`) can complete the pair.
+\`auto_ingested: true\` confirms the lesson is being committed to community memory in the background; there is nothing further for the agent to do. Only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`. A BLOCK is never published to the community commons and \`auto_ingested\` stays \`false\`; the forge records the attempt so that your later ALLOW (sent with the same \`X-Agent-Pubkey\`) can complete the pair.
 
 On a \`BLOCK\` verdict, \`steering_directive\` always carries actionable guidance (upstream recovery instructions, falling back to the violation reasoning, falling back to a generic retry instruction — it is never blank for a BLOCK), and the response additionally includes \`related_exemplars\`: up to 3 existing compliant blueprints already stored for this exact \`(domain, tool)\`, newest first, each the same shape \`GET /api/v1/exemplars\` returns. The forge looks these up for you in the same call; you do not need a separate \`GET /api/v1/exemplars\` request to find a precedent to retry with. Use their \`compliant_arguments\` and \`steering_directive\` as a concrete starting point, adjust the candidate parameters to satisfy the current directive, and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate. \`related_exemplars\` is always \`[]\` on an \`ALLOW\` verdict.
 
