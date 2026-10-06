@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import app from "../src/index";
 import type { Env, ExemplarRow } from "../src/types";
 import { sha256Hex } from "@ramen-ai/node-core";
+import { CALIBRATION_ATTEMPT_COLUMNS } from "../src/telemetry";
 
 const makeRow = (overrides: Partial<ExemplarRow> = {}): ExemplarRow => ({
   id: "11111111-1111-4111-8111-111111111111",
@@ -21,8 +22,17 @@ const makeRow = (overrides: Partial<ExemplarRow> = {}): ExemplarRow => ({
   canonical_payload: null,
   times_applied: 0,
   successful_applications: 0,
+  agent_pubkey: null,
   ...overrides,
 });
+
+/** Mirrors ORPHANED_BLOCK_WHERE: raw failure parameters with no compliant counterpart yet. */
+const isOrphanedBlock = (row: ExemplarRow) => row.repaired_arguments_json === "{}" && row.failed_arguments_json !== "{}";
+const isOrphanedAllow = (row: ExemplarRow) =>
+  row.repaired_arguments_json !== "{}" && (row.steering_directive === "Compliant operational blueprint" || row.steering_directive === "");
+
+/** A row of the calibration_attempts telemetry table, keyed by column name. */
+type TelemetryRow = Record<(typeof CALIBRATION_ATTEMPT_COLUMNS)[number], unknown>;
 
 /**
  * Keeps `undefined` apart from "set to empty" so the enrichment CASE WHEN
@@ -46,6 +56,7 @@ function enrichedExemplarUpsert(rows: ExemplarRow[], binds: unknown[]): { id: st
     createdAt,
     signature,
     canonicalPayload,
+    agentPubkey,
   ] = binds as string[];
 
   const existing = rows.find(
@@ -71,6 +82,7 @@ function enrichedExemplarUpsert(rows: ExemplarRow[], binds: unknown[]): { id: st
       canonical_payload: canonicalPayload,
       times_applied: 0,
       successful_applications: 0,
+      agent_pubkey: agentPubkey ?? null,
     });
     return { id: exemplarId };
   }
@@ -112,7 +124,7 @@ function enrichedExemplarUpsert(rows: ExemplarRow[], binds: unknown[]): { id: st
   return { id: existing.id };
 }
 
-function createDb(rows: ExemplarRow[]) {
+function createDb(rows: ExemplarRow[], telemetry: TelemetryRow[] = []) {
   const queries: { sql: string; binds: unknown[] }[] = [];
   const db = {
     prepare(sql: string) {
@@ -132,16 +144,37 @@ function createDb(rows: ExemplarRow[]) {
               ] as T[],
             };
           }
+          // Private bounty query: orphaned blocks and/or orphaned allows, optional domain/tool filters.
+          if (sql.includes("steering_directive = 'Compliant operational blueprint'") || sql.includes("failed_arguments_json != '{}')")) {
+            if (!sql.includes("NOT (repaired_arguments_json")) {
+              const wantsBlocks = sql.includes("repaired_arguments_json = '{}' AND failed_arguments_json != '{}'");
+              const wantsAllows = sql.includes("steering_directive = 'Compliant operational blueprint'");
+              const filters = binds.slice(0, -2) as string[];
+              const pending = [...filters];
+              let selected = rows.filter((row) => (wantsBlocks && isOrphanedBlock(row)) || (wantsAllows && isOrphanedAllow(row)));
+              if (sql.includes("domain = ?")) {
+                const value = pending.shift();
+                selected = selected.filter((row) => row.domain === value);
+              }
+              if (sql.includes("tool_name = ?")) {
+                const value = pending.shift();
+                selected = selected.filter((row) => row.tool_name === value);
+              }
+              return { results: selected as T[] };
+            }
+          }
+          // Public reads exclude orphaned blocks (PUBLIC_ROWS_WHERE); mirror that filter here.
+          const visibleRows = sql.includes("NOT (repaired_arguments_json") ? rows.filter((row) => !isOrphanedBlock(row)) : rows;
           // fetchRelatedExemplars: "WHERE domain = ? AND tool_name = ? ... LIMIT ?", no
           // LIKE/GROUP BY, offset, or other filters -- a shape distinct enough to special-case.
           if (sql.includes("domain = ?") && sql.includes("tool_name = ?") && !sql.includes("LIKE ?") && !sql.includes("task_fingerprint")) {
             const [domainBind, toolNameBind, limitBind] = binds as [string, string, number];
-            const selected = rows
+            const selected = visibleRows
               .filter((row) => row.domain === domainBind && row.tool_name === toolNameBind)
               .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
             return { results: selected.slice(0, Number(limitBind ?? 10)) as T[] };
           }
-          let selected = [...rows];
+          let selected = [...visibleRows];
           if (sql.includes("LIKE ?")) {
             const pattern = String(binds.find((value) => typeof value === "string" && value.startsWith("%")) ?? "");
             const query = pattern.slice(1, -1).toLowerCase();
@@ -159,12 +192,40 @@ function createDb(rows: ExemplarRow[]) {
           // calibrate handler reaches evaluateCalibration() during tests.
           if (sql.includes("global_count")) return { global_count: 0 } as T;
           if (sql.includes("RETURNING request_count")) return { request_count: 1 } as T;
+          // findPriorBlock: latest verified BLOCK for (agent_pubkey, domain, tool_name, task_fingerprint).
+          if (sql.includes("FROM calibration_attempts")) {
+            const [agent, domain, tool, fingerprint] = binds as string[];
+            const match = [...telemetry]
+              .reverse()
+              .find(
+                (row) =>
+                  row.agent_pubkey === agent &&
+                  row.domain === domain &&
+                  row.tool_name === tool &&
+                  row.task_fingerprint === fingerprint &&
+                  row.verdict === 0 &&
+                  row.receipt_verified === 1,
+              );
+            return (match ?? null) as T | null;
+          }
           return null as T | null;
         },
         async run() {
-          // autoIngestCompliantBlueprint writes with a single .run(), not a .batch();
-          // mirror the real UPSERT_SQL's enrichment/lock semantics so assertions on
-          // `rows` after a calibrate call see the same effect a real upsert would have.
+          // Calibrate writes with single .run() calls, not a .batch(). Mirror the real SQL's
+          // semantics so assertions on `rows` / `telemetry` see the effect a real write would have.
+          if (sql.startsWith("INSERT INTO calibration_attempts")) {
+            telemetry.push(Object.fromEntries(CALIBRATION_ATTEMPT_COLUMNS.map((column, i) => [column, binds[i]])) as TelemetryRow);
+            return { meta: { changes: 1 } };
+          }
+          if (sql.includes("ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule) DO NOTHING")) {
+            const [, domain, taskFingerprint, , toolName, violationRule] = binds as string[];
+            const exists = rows.some(
+              (row) => row.domain === domain && row.tool_name === toolName && row.task_fingerprint === taskFingerprint && row.violation_rule === violationRule,
+            );
+            if (exists) return { meta: { changes: 0 } };
+            enrichedExemplarUpsert(rows, binds);
+            return { meta: { changes: 1 } };
+          }
           if (sql.includes("ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule)")) {
             enrichedExemplarUpsert(rows, binds);
             return { meta: { changes: 1 } };
@@ -193,7 +254,7 @@ function createDb(rows: ExemplarRow[]) {
       return [{ results: [] }, { results: [] }];
     },
   };
-  return { db: db as unknown as D1Database, queries };
+  return { db: db as unknown as D1Database, queries, telemetry };
 }
 
 function envWith(rows: ExemplarRow[] = [makeRow()]): Env {
@@ -666,7 +727,7 @@ describe("automatic ingestion on successful calibration", () => {
     expect(stored.violation_rule).toBe("No violation: compliant reference action");
   });
 
-  it("does not auto-ingest and reports auto_ingested: false on a BLOCK verdict", async () => {
+  it("keeps a BLOCK as a private orphaned block and reports auto_ingested: false", async () => {
     vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
     const candidateArguments = { force_sensor: "degraded", stop: "unavailable" };
     const input = JSON.stringify({ tool: "dispatch_manipulation", arguments: candidateArguments });
@@ -689,8 +750,12 @@ describe("automatic ingestion on successful calibration", () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.allowed).toBe(false);
+    // auto_ingested reports only the public commons write; the orphan below is private.
     expect(body.auto_ingested).toBe(false);
-    expect(rows).toHaveLength(0);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.failed_arguments_json)).toEqual(candidateArguments);
+    expect(rows[0]!.repaired_arguments_json).toBe("{}");
+    expect(isOrphanedBlock(rows[0]!)).toBe(true);
   });
 
   it("does not auto-ingest an ALLOW verdict with an empty candidate arguments object", async () => {
@@ -937,5 +1002,335 @@ describe("query and domain endpoints", () => {
         { domain: "robotics", lesson_count: 1, tools: ["dispatch_manipulation"] },
       ],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agent identity, telemetry split, pairing, and the private bounty endpoint
+// ---------------------------------------------------------------------------
+
+const AGENT_HEX = "ab".repeat(32);
+const OTHER_AGENT_HEX = "cd".repeat(32);
+const AGENT_BASE64URL = btoa(String.fromCharCode(...new Uint8Array(32).fill(0xab)))
+  .replace(/\+/g, "-")
+  .replace(/\//g, "_")
+  .replace(/=+$/, "");
+const ADMIN_TOKEN = "test-admin-token-0123456789";
+const BLOCK_RECEIPT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const ALLOW_RECEIPT = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+/** An upstream /evaluate response whose receipt payload_hash matches the exact input evaluated. */
+async function upstreamFor(tool: string, args: object, allowed: boolean, receiptId: string) {
+  const input = JSON.stringify({ tool, arguments: args });
+  const canonicalPayload = JSON.stringify({
+    schema_version: "5.0",
+    kid: "ramen_pk_v1",
+    id: receiptId,
+    verdict: allowed ? 1 : 0,
+    payload_hash: await sha256Hex(input),
+    policy_ids: ["industrial_iot_actuation_invariance"],
+  });
+  return {
+    data: {
+      allowed,
+      policy_ids: ["industrial_iot_actuation_invariance"],
+      total_violations: allowed
+        ? []
+        : [{ rule_id: "r1", rule_name: "force-sensor-health", reasoning: "sensor degraded", recovery_instruction: "Restore the force sensor." }],
+      results: [],
+      statutory_anchors: ["ISO 10218-1:2025"],
+      receipt: {
+        id: receiptId,
+        schema_version: "5.0",
+        kid: "ramen_pk_v1",
+        signature: btoa("\u0000".repeat(64)),
+        canonical_payload: canonicalPayload,
+      },
+    },
+  };
+}
+
+function stubEvaluate(body: unknown) {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response(JSON.stringify(body), { status: 200 })));
+}
+
+function calibrateHarness(rows: ExemplarRow[] = [], telemetry: TelemetryRow[] = []) {
+  vi.spyOn(globalThis.crypto.subtle, "verify").mockResolvedValue(true);
+  const { db } = createDb(rows, telemetry);
+  const env: Env = {
+    DB: db,
+    RAMEN_API_KEY: "test-api-key",
+    RAMEN_GATEWAY_URL: "https://gateway.example.test",
+    FORGE_ADMIN_TOKEN: ADMIN_TOKEN,
+  };
+  const calibrate = (body: object, headers: Record<string, string> = {}) =>
+    app.request(
+      "/api/v1/calibrate",
+      { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) },
+      env,
+    );
+  return { env, rows, telemetry, calibrate };
+}
+
+const BAD_ARGS = { force_sensor: "degraded" };
+const GOOD_ARGS = { force_sensor: "ok", commanded_velocity_mps: 0.05 };
+const TASK = "Move the identified crucible";
+const request = (args: object) => ({ domain: "industrial_iot", tool: "dispatch_manipulation", arguments: args, task_description: TASK });
+
+describe("X-Agent-Pubkey header", () => {
+  it("records a hex key on calibrate telemetry, and normalises base64url to the same label", async () => {
+    const h = calibrateHarness();
+    stubEvaluate(await upstreamFor("dispatch_manipulation", GOOD_ARGS, true, ALLOW_RECEIPT));
+
+    expect((await h.calibrate(request(GOOD_ARGS), { "X-Agent-Pubkey": AGENT_HEX.toUpperCase() })).status).toBe(200);
+    expect((await h.calibrate(request(GOOD_ARGS), { "X-Agent-Pubkey": AGENT_BASE64URL })).status).toBe(200);
+
+    expect(h.telemetry.map((row) => row.agent_pubkey)).toEqual([AGENT_HEX, AGENT_HEX]);
+    // First contributor wins on the canonical row.
+    expect(h.rows[0]?.agent_pubkey).toBe(AGENT_HEX);
+  });
+
+  it("treats an absent header as an anonymous agent", async () => {
+    const h = calibrateHarness();
+    stubEvaluate(await upstreamFor("dispatch_manipulation", GOOD_ARGS, true, ALLOW_RECEIPT));
+    expect((await h.calibrate(request(GOOD_ARGS))).status).toBe(200);
+    expect(h.telemetry[0]?.agent_pubkey).toBeNull();
+  });
+
+  it("rejects a malformed key with 400 on calibrate, exemplar search, and feedback", async () => {
+    const h = calibrateHarness();
+    const headers = { "X-Agent-Pubkey": "not-a-key" };
+
+    const calibrated = await h.calibrate(request(GOOD_ARGS), headers);
+    expect(calibrated.status).toBe(400);
+    expect((await calibrated.json()).error).toContain("X-Agent-Pubkey");
+    expect(h.telemetry).toHaveLength(0);
+
+    expect((await app.request("/api/v1/exemplars", { headers }, h.env)).status).toBe(400);
+    const feedback = await app.request(
+      `/api/v1/exemplars/${BLOCK_RECEIPT}/feedback`,
+      { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ success: true }) },
+      h.env,
+    );
+    expect(feedback.status).toBe(400);
+  });
+
+  it("accepts a valid key on exemplar search and feedback", async () => {
+    const h = calibrateHarness([makeRow()]);
+    const headers = { "X-Agent-Pubkey": AGENT_HEX };
+
+    const search = await app.request("/api/v1/exemplars", { headers }, h.env);
+    expect(search.status).toBe(200);
+    expect((await search.json()).count).toBe(1);
+
+    // Passes the identity check and reaches the handler (the mock reports no matching row).
+    const feedback = await app.request(
+      `/api/v1/exemplars/${BLOCK_RECEIPT}/feedback`,
+      { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ success: true }) },
+      h.env,
+    );
+    expect(feedback.status).toBe(404);
+  });
+
+  it("is allowed by the CORS preflight so browser agents can send it", async () => {
+    const h = calibrateHarness();
+    const preflight = await app.request(
+      "/api/v1/calibrate",
+      {
+        method: "OPTIONS",
+        headers: { Origin: "https://agent.example.test", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "x-agent-pubkey" },
+      },
+      h.env,
+    );
+    expect(preflight.headers.get("Access-Control-Allow-Headers")?.toLowerCase()).toContain("x-agent-pubkey");
+  });
+});
+
+describe("calibration telemetry and BLOCK/ALLOW pairing", () => {
+  it("logs every evaluated attempt: BLOCK, ALLOW, and an upstream failure", async () => {
+    const h = calibrateHarness();
+    const headers = { "X-Agent-Pubkey": AGENT_HEX };
+
+    stubEvaluate(await upstreamFor("dispatch_manipulation", BAD_ARGS, false, BLOCK_RECEIPT));
+    await h.calibrate(request(BAD_ARGS), headers);
+    stubEvaluate(await upstreamFor("dispatch_manipulation", GOOD_ARGS, true, ALLOW_RECEIPT));
+    await h.calibrate(request(GOOD_ARGS), headers);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+    const failed = await h.calibrate(request(GOOD_ARGS), headers);
+    expect(failed.status).toBe(502);
+
+    expect(h.telemetry.map((row) => row.verdict)).toEqual([0, 1, null]);
+    const [block, allow, failure] = h.telemetry;
+    expect(block).toMatchObject({
+      agent_pubkey: AGENT_HEX,
+      domain: "industrial_iot",
+      tool_name: "dispatch_manipulation",
+      receipt_id: BLOCK_RECEIPT,
+      receipt_verified: 1,
+      steering_directive: "Restore the force sensor.",
+      violation_rule: "force-sensor-health",
+      evaluated_input: JSON.stringify({ tool: "dispatch_manipulation", arguments: BAD_ARGS }),
+    });
+    expect(JSON.parse(block?.arguments_json as string)).toEqual(BAD_ARGS);
+    expect(JSON.parse(block?.receipt_json as string).id).toBe(BLOCK_RECEIPT);
+    expect(allow?.receipt_id).toBe(ALLOW_RECEIPT);
+    expect(failure).toMatchObject({ receipt_id: null, receipt_json: null, error: "ramen-ai evaluation unreachable" });
+    // Same agent + domain + tool + task: one fingerprint across all three.
+    expect(new Set(h.telemetry.map((row) => row.task_fingerprint)).size).toBe(1);
+    // Raw IPs are never stored.
+    expect(String(block?.client_ip_hash)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("merges a Turn 2 ALLOW into the same agent's Turn 1 BLOCK as one paired row", async () => {
+    const h = calibrateHarness();
+    const headers = { "X-Agent-Pubkey": AGENT_HEX };
+
+    stubEvaluate(await upstreamFor("dispatch_manipulation", BAD_ARGS, false, BLOCK_RECEIPT));
+    const turn1 = await h.calibrate(request(BAD_ARGS), headers);
+    expect((await turn1.json()).auto_ingested).toBe(false);
+    expect(h.rows).toHaveLength(1);
+    expect(isOrphanedBlock(h.rows[0]!)).toBe(true);
+
+    stubEvaluate(await upstreamFor("dispatch_manipulation", GOOD_ARGS, true, ALLOW_RECEIPT));
+    const turn2 = await h.calibrate(request(GOOD_ARGS), headers);
+    expect((await turn2.json()).auto_ingested).toBe(true);
+
+    expect(h.rows).toHaveLength(1);
+    const pair = h.rows[0]!;
+    expect(pair.id).toBe(BLOCK_RECEIPT);
+    expect(JSON.parse(pair.failed_arguments_json)).toEqual(BAD_ARGS);
+    expect(JSON.parse(pair.repaired_arguments_json)).toEqual(GOOD_ARGS);
+    expect(pair.violation_rule).toBe("force-sensor-health");
+    expect(pair.steering_directive).toBe("Restore the force sensor.");
+    expect(pair.receipt_id).toBe(ALLOW_RECEIPT);
+    expect(pair.agent_pubkey).toBe(AGENT_HEX);
+    expect(isOrphanedBlock(pair)).toBe(false);
+    expect(isOrphanedAllow(pair)).toBe(false);
+  });
+
+  it("does not pair across agents, across tasks, or for anonymous callers", async () => {
+    const h = calibrateHarness();
+
+    stubEvaluate(await upstreamFor("dispatch_manipulation", BAD_ARGS, false, BLOCK_RECEIPT));
+    await h.calibrate(request(BAD_ARGS), { "X-Agent-Pubkey": AGENT_HEX });
+
+    stubEvaluate(await upstreamFor("dispatch_manipulation", GOOD_ARGS, true, ALLOW_RECEIPT));
+    // Different agent, same task.
+    await h.calibrate(request(GOOD_ARGS), { "X-Agent-Pubkey": OTHER_AGENT_HEX });
+    // Same agent, different task.
+    await h.calibrate({ ...request(GOOD_ARGS), task_description: "A different task" }, { "X-Agent-Pubkey": AGENT_HEX });
+    // Anonymous.
+    await h.calibrate(request(GOOD_ARGS));
+
+    const orphanBlock = h.rows.find((row) => row.id === BLOCK_RECEIPT);
+    expect(orphanBlock && isOrphanedBlock(orphanBlock)).toBe(true);
+    expect(h.rows.filter((row) => row.id !== BLOCK_RECEIPT).every((row) => row.failed_arguments_json === "{}")).toBe(true);
+  });
+
+  it("never serves an orphaned block on any public read", async () => {
+    const h = calibrateHarness();
+    stubEvaluate(await upstreamFor("dispatch_manipulation", BAD_ARGS, false, BLOCK_RECEIPT));
+    await h.calibrate(request(BAD_ARGS), { "X-Agent-Pubkey": AGENT_HEX });
+    expect(h.rows).toHaveLength(1);
+
+    const list = await (await app.request("/api/v1/exemplars", {}, h.env)).json();
+    expect(list.count).toBe(0);
+
+    // A later BLOCK's related_exemplars must not surface it either.
+    const second = await h.calibrate(request({ force_sensor: "offline" }), { "X-Agent-Pubkey": AGENT_HEX });
+    expect((await second.json()).related_exemplars).toEqual([]);
+  });
+
+  it("never exposes agent_pubkey on public reads", async () => {
+    const h = calibrateHarness([makeRow({ agent_pubkey: AGENT_HEX })]);
+    const body = JSON.stringify(await (await app.request("/api/v1/exemplars", {}, h.env)).json());
+    expect(body).not.toContain(AGENT_HEX);
+  });
+});
+
+describe("private bounty endpoint", () => {
+  const orphanedBlock = makeRow({
+    id: "a1111111-1111-4111-8111-111111111111",
+    failed_arguments_json: JSON.stringify(BAD_ARGS),
+    repaired_arguments_json: "{}",
+    agent_pubkey: AGENT_HEX,
+  });
+  const orphanedAllow = makeRow({
+    id: "a2222222-2222-4222-8222-222222222222",
+    repaired_arguments_json: JSON.stringify(GOOD_ARGS),
+    steering_directive: "Compliant operational blueprint",
+  });
+  const complete = makeRow({
+    id: "a3333333-3333-4333-8333-333333333333",
+    failed_arguments_json: JSON.stringify(BAD_ARGS),
+    repaired_arguments_json: JSON.stringify(GOOD_ARGS),
+    steering_directive: "Restore the force sensor.",
+  });
+  const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+  it("rejects a missing Authorization header with 401", async () => {
+    const h = calibrateHarness([orphanedBlock]);
+    const response = await app.request("/api/v1/exemplars/bounties", {}, h.env);
+    expect(response.status).toBe(401);
+    expect(response.headers.get("WWW-Authenticate")).toContain("Bearer");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    const text = await response.text();
+    expect(text).not.toContain("force_sensor");
+  });
+
+  it("rejects a wrong token, a non-Bearer scheme, and an empty bearer with 401", async () => {
+    const h = calibrateHarness([orphanedBlock]);
+    for (const headers of [bearer("wrong-token"), { Authorization: `Basic ${ADMIN_TOKEN}` }, { Authorization: "Bearer " }, bearer(`${ADMIN_TOKEN}x`)]) {
+      expect((await app.request("/api/v1/exemplars/bounties", { headers }, h.env)).status).toBe(401);
+    }
+  });
+
+  it("does not accept the write token, and fails closed when FORGE_ADMIN_TOKEN is unset", async () => {
+    const h = calibrateHarness([orphanedBlock]);
+    const withWriteToken: Env = { ...h.env, FORGE_WRITE_TOKEN: "test-write-token" };
+    expect((await app.request("/api/v1/exemplars/bounties", { headers: bearer("test-write-token") }, withWriteToken)).status).toBe(401);
+
+    const unset: Env = { ...h.env, FORGE_ADMIN_TOKEN: undefined };
+    for (const token of ["undefined", "", ADMIN_TOKEN]) {
+      expect((await app.request("/api/v1/exemplars/bounties", { headers: bearer(token) }, unset)).status).toBe(401);
+    }
+  });
+
+  it("returns orphaned blocks and orphaned allows, and omits complete pairs", async () => {
+    const h = calibrateHarness([orphanedBlock, orphanedAllow, complete]);
+    const response = await app.request("/api/v1/exemplars/bounties", { headers: bearer(ADMIN_TOKEN) }, h.env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    const body = await response.json();
+    expect(body.count).toBe(2);
+    const byKind = Object.fromEntries(body.bounties.map((b: { kind: string }) => [b.kind, b]));
+    expect(byKind.orphaned_block).toMatchObject({
+      id: orphanedBlock.id,
+      missing: ["compliant_arguments", "allow_receipt"],
+      failed_arguments: BAD_ARGS,
+      compliant_arguments: {},
+      agent_pubkey: AGENT_HEX,
+    });
+    expect(byKind.orphaned_allow).toMatchObject({
+      id: orphanedAllow.id,
+      missing: ["steering_directive"],
+      compliant_arguments: GOOD_ARGS,
+    });
+  });
+
+  it("filters by kind and rejects an unknown kind", async () => {
+    const h = calibrateHarness([orphanedBlock, orphanedAllow]);
+    const blocks = await (await app.request("/api/v1/exemplars/bounties?kind=orphaned_block", { headers: bearer(ADMIN_TOKEN) }, h.env)).json();
+    expect(blocks.bounties.map((b: { kind: string }) => b.kind)).toEqual(["orphaned_block"]);
+    const allows = await (await app.request("/api/v1/exemplars/bounties?kind=orphaned_allow", { headers: bearer(ADMIN_TOKEN) }, h.env)).json();
+    expect(allows.bounties.map((b: { kind: string }) => b.kind)).toEqual(["orphaned_allow"]);
+    const invalid = await app.request("/api/v1/exemplars/bounties?kind=everything", { headers: bearer(ADMIN_TOKEN) }, h.env);
+    expect(invalid.status).toBe(400);
+  });
+
+  it("is not swallowed by the public GET /exemplars/:id route", async () => {
+    const h = calibrateHarness([orphanedBlock]);
+    const response = await app.request("/api/v1/exemplars/bounties", { headers: bearer(ADMIN_TOKEN) }, h.env);
+    expect((await response.json()).success).toBe(true);
   });
 });

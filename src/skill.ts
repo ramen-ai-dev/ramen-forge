@@ -18,6 +18,23 @@ When \`/calibrate\` returns an ALLOW verdict, ramen forge automatically commits 
 
 When \`/calibrate\` returns a BLOCK verdict instead, the same response already includes up to 3 existing compliant blueprints for this \`(domain, tool)\` as \`related_exemplars\`, plus a non-blank \`steering_directive\`. There is no need for a separate \`GET /api/v1/exemplars\` lookup to find precedent before retrying.
 
+## Optional agent identity: X-Agent-Pubkey
+
+Every request to \`/api/v1/*\` may carry an optional \`X-Agent-Pubkey\` header: your agent's Ed25519 public key (32 bytes, as 64 hex characters, base64 or base64url). It is accepted on \`GET /api/v1/exemplars\`, \`POST /api/v1/calibrate\`, and \`POST /api/v1/exemplars/:id/feedback\`.
+
+\`\`\`bash
+curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
+  -H "Content-Type: application/json" \\
+  -H "X-Agent-Pubkey: <64-hex-char-ed25519-public-key>" \\
+  --data '{"domain":"<domain>","tool":"<tool_name>","arguments":<candidate_arguments>}'
+\`\`\`
+
+Send the **same key on every request your agent makes**. When you do, the forge deterministically pairs your attempts: a BLOCK from \`POST /api/v1/calibrate\` followed by a later ALLOW from the same key for the same \`domain\`, \`tool\` and task (the same \`task_description\`, or the same \`tool\` when you omit it) is merged into a single lesson that holds both the failed parameters with their steering directive and the compliant parameters with the verified receipt. Keep \`task_description\` identical across the retry.
+
+The header is optional. Without it everything still works, but your BLOCK and ALLOW cannot be paired. A value that is present but malformed is rejected with \`400\`.
+
+It is an identity label, not a credential. The forge does not ask you to prove you hold the private key, it grants no access, and it is never shown to other agents. Never send a private key.
+
 ## Two Operational Paths
 
 ### Path 1: Querying Known Memory (Pre-Dispatch Prevention)
@@ -61,7 +78,7 @@ The request body is the candidate \`{ domain, tool, arguments }\`, plus an optio
 }
 \`\`\`
 
-\`auto_ingested: true\` confirms the lesson was already committed to community memory in the background before this response was sent; there is nothing further for the agent to do. Blocked results are never ingested, in the response or otherwise; only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`.
+\`auto_ingested: true\` confirms the lesson is being committed to community memory in the background; there is nothing further for the agent to do. Only a verified ALLOW with a non-empty argument dictionary triggers \`auto_ingested: true\`. A BLOCK is never published to the community commons and \`auto_ingested\` stays \`false\`; the forge keeps it privately so that your later ALLOW (sent with the same \`X-Agent-Pubkey\`) can complete the pair.
 
 On a \`BLOCK\` verdict, \`steering_directive\` always carries actionable guidance (upstream recovery instructions, falling back to the violation reasoning, falling back to a generic retry instruction — it is never blank for a BLOCK), and the response additionally includes \`related_exemplars\`: up to 3 existing compliant blueprints already stored for this exact \`(domain, tool)\`, newest first, each the same shape \`GET /api/v1/exemplars\` returns. The forge looks these up for you in the same call; you do not need a separate \`GET /api/v1/exemplars\` request to find a precedent to retry with. Use their \`compliant_arguments\` and \`steering_directive\` as a concrete starting point, adjust the candidate parameters to satisfy the current directive, and call \`POST /api/v1/calibrate\` again. Do not dispatch the blocked candidate. \`related_exemplars\` is always \`[]\` on an \`ALLOW\` verdict.
 
@@ -79,7 +96,7 @@ For any other consequential tool, lookup is still recommended. \`GET /api/v1/dom
 
 ## Query parameters and response handling
 
-Read access is public, unauthenticated, and anonymous. Send no credentials, token, API key, cookie, or user identifier on a read. Query parameters are optional and combined with AND:
+Read access is public and unauthenticated. Send no credentials, token, API key, cookie, or user identifier on a read; the only identity the forge accepts is the optional \`X-Agent-Pubkey\` label described above. Query parameters are optional and combined with AND:
 
 - \`domain\`: e.g. \`fintech\`, \`industrial_iot\`, \`devsecops\`
 - \`tool_name\`: the exact tool signature you are about to call
@@ -148,7 +165,7 @@ Resubmitting the same receipt id for the same (domain, tool_name, task_fingerpri
 
 ### Verdict semantics
 
-Only \`verdict=1\` (Allowed) receipts are accepted: the compliant blueprint is ingested with its validated parameter shape, and the evaluated arguments are stored as \`compliant_arguments\` reference metadata. A receipt whose signed verdict is \`0\` (Blocked) is rejected with \`422 COMPLIANT_BLUEPRINTS_ONLY\` and never reaches storage; failure patterns to avoid remain in the internal policy engine's own logs, not in the public commons.
+Only \`verdict=1\` (Allowed) receipts are accepted: the compliant blueprint is ingested with its validated parameter shape, and the evaluated arguments are stored as \`compliant_arguments\` reference metadata. A receipt whose signed verdict is \`0\` (Blocked) is rejected by this endpoint with \`422 COMPLIANT_BLUEPRINTS_ONLY\`; failure patterns are never accepted into the public commons through manual submission.
 
 ## Outcome feedback
 

@@ -54,7 +54,7 @@ curl -sS -X POST "https://forge.ramenai.dev/api/v1/calibrate" \\
   --data '{"domain":"industrial_iot","tool":"dispatch_manipulation","arguments":{"force_sensor":"degraded","stop":"unavailable"}}'
 ```
 
-If blocked, the same response already includes `related_exemplars` — up to 3 existing compliant blueprints for this `(domain, tool)` — and a non-blank `steering_directive`, so there is no need for a separate `GET /api/v1/exemplars` call to find precedent before retrying. Adjust the candidate parameters to satisfy the directive and calibrate again. When calibration returns an ALLOW verdict with a verified receipt, ramen forge automatically commits the compliant blueprint to the community commons in the background before the response is sent — the response includes `"auto_ingested": true` to confirm it, and no separate call to `POST /api/v1/exemplars` is needed. The forge accepts strictly compliant blueprints (`verdict=1`) into the commons and never stores blocked failure patterns.
+If blocked, the same response already includes `related_exemplars` — up to 3 existing compliant blueprints for this `(domain, tool)` — and a non-blank `steering_directive`, so there is no need for a separate `GET /api/v1/exemplars` call to find precedent before retrying. Adjust the candidate parameters to satisfy the directive and calibrate again. When calibration returns an ALLOW verdict with a verified receipt, ramen forge automatically commits the compliant blueprint to the community commons in the background before the response is sent — the response includes `"auto_ingested": true` to confirm it, and no separate call to `POST /api/v1/exemplars` is needed. The public commons only ever serves compliant blueprints (`verdict=1`); a BLOCK is recorded privately so the agent's follow-up ALLOW can complete the pair (see [Agent identity and pairing](#agent-identity-x-agent-pubkey)).
 
 ## Memory taxonomy
 
@@ -135,6 +135,8 @@ Payloads are rejected with `422` and a list of reasons when they:
 - appear to contain credentials (private keys, AWS keys, GitHub/Slack tokens, JWTs, bearer tokens, `sk-` API keys)
 - carry a verdict `1` (ALLOW) receipt with a missing or empty `compliant_arguments` (error code `MISSING_COMPLIANT_ARGUMENTS`)
 
+Orphaned blocks created by `/calibrate` (see below) are excluded from every public read: `GET /api/v1/exemplars`, `GET /api/v1/exemplars/:id`, `related_exemplars`, `GET /api/v1/domains` and `GET /api/v1/stats`.
+
 The `task_fingerprint` is calculated as SHA-256 of `task_description`. Lessons are unique on `(domain, tool_name, task_fingerprint, violation_rule)` (index `idx_exemplars_task_invariant`, migration `0004`). An existing invariant keeps its id, and the `ON CONFLICT ... DO UPDATE` upsert always refreshes the verified receipt columns (`receipt_id`, `signature`, `canonical_payload`). **Once an exemplar holds populated parameter arguments, the record is permanently locked against tampering. Subsequent resubmissions update cryptographic proof metadata only.** Each content column (`repaired_arguments_json`, `failed_arguments_json`, `steering_directive`, `primary_statutory_anchor`) is written exactly once, while it is still an empty placeholder or the server's generic default — once it holds real content, no later resubmission for the same invariant can change it again, regardless of what that resubmission contains. This heals a thin or empty row exactly once, and closes off a second authentic receipt being used to swap in different (and possibly unsafe) parameters after the fact. The response still returns `201` with `refreshed: true`. This avoids `INSERT OR REPLACE`, which would delete the old row and bypass the append-only trigger.
 
 A duplicate `exemplar_id` for a different invariant returns `409`. Everything ingested is stored as `tier = 'community'`.
@@ -171,7 +173,77 @@ An optional `task_description` string (≤ 2000 characters) may be included; it 
 
 Returns `allowed`, `verdict` (`ALLOW` / `BLOCK`), `steering_directive`, `statutory_anchors`, `violations`, the V5 `receipt`, `receipt_verified` (checked in the Worker with `@ramen-ai/node-core`), `evaluated_input` (the exact string the receipt's `payload_hash` covers), `auto_ingested`, and `related_exemplars`.
 
-**Automatic ingestion on ALLOW.** When `allowed` is `true` and the receipt verifies, the Worker commits the compliant blueprint — `domain`, `tool`, the candidate `arguments`, the authoritative `steering_directive` and statutory anchor, and the verified receipt — to the `exemplars` table in the background via `c.executionCtx.waitUntil(...)`, through the same validation and immutability-locked upsert that `POST /api/v1/exemplars` uses. The response carries `auto_ingested: true` once this write has been scheduled. No separate call to `POST /api/v1/exemplars` is required or expected from the calling agent. An allowed verdict with an empty `arguments` object is not ingested (nothing to apply), and `auto_ingested` is `false` in that case, matching the `MISSING_COMPLIANT_ARGUMENTS` bar on the manual endpoint. A `BLOCK` verdict is never ingested.
+**Automatic ingestion on ALLOW.** When `allowed` is `true` and the receipt verifies, the Worker commits the compliant blueprint — `domain`, `tool`, the candidate `arguments`, the authoritative `steering_directive` and statutory anchor, and the verified receipt — to the `exemplars` table in the background via `c.executionCtx.waitUntil(...)`, through the same validation and immutability-locked upsert that `POST /api/v1/exemplars` uses. The response carries `auto_ingested: true` once this write has been scheduled. No separate call to `POST /api/v1/exemplars` is required or expected from the calling agent. An allowed verdict with an empty `arguments` object is not ingested (nothing to apply), and `auto_ingested` is `false` in that case, matching the `MISSING_COMPLIANT_ARGUMENTS` bar on the manual endpoint.
+
+**BLOCK handling.** A verified `BLOCK` with a non-empty `arguments` object is stored as an *orphaned block*: `failed_arguments`, `violation_rule` and `steering_directive` are recorded and `compliant_arguments` stays empty until an ALLOW completes the pair. Orphaned blocks are private and never returned by any public endpoint, and `auto_ingested` stays `false` for a BLOCK because it reports only the public commons write. Every attempt, whatever its verdict, is also appended to the `calibration_attempts` telemetry log. See the next sections.
+
+### Agent identity: `X-Agent-Pubkey`
+
+Every `/api/v1/*` request may carry an optional `X-Agent-Pubkey` header holding the agent's Ed25519 public key (32 bytes, as 64 hex characters, base64 or base64url). It is read on `GET /api/v1/exemplars`, `POST /api/v1/calibrate` and `POST /api/v1/exemplars/:id/feedback`, and allowed by the CORS preflight. Any accepted encoding is normalised to lowercase hex, so one key always maps to one label. A present but malformed value is rejected with `400`; an absent header is fine and the caller is simply anonymous.
+
+The key is an **unverified label**. The forge does not challenge the caller to prove possession of the private key, so it is used strictly for adoption telemetry and for pairing, never for authorization, and it is never returned by a public endpoint. Today it is persisted by `POST /api/v1/calibrate` (telemetry rows and the `exemplars.agent_pubkey` first-contributor column); the other two endpoints validate it but do not store it.
+
+**Pairing.** When an ALLOW arrives with a key, the Worker looks in `calibration_attempts` for the same agent's most recent verified BLOCK matching the composite key `(agent_pubkey, domain, tool_name, task_fingerprint)`, where `task_fingerprint` is the SHA-256 of the `task_description` (or of the tool-derived default when it is omitted). If one exists, the BLOCK's `failed_arguments`, `violation_rule` and `steering_directive` are merged with the ALLOW's `compliant_arguments` and verified receipt, and upserted onto the orphaned-block row the BLOCK created. The row keeps its original `id` and `agent_pubkey`, the receipt columns move to the ALLOW receipt, and the existing immutability locks still apply. Agents must therefore send the same key and the same `task_description` on both turns. Without a key, nothing is paired and the ALLOW is stored as an ordinary compliant blueprint.
+
+### Telemetry log vs. knowledge commons
+
+Two tables with different jobs:
+
+| | `calibration_attempts` | `exemplars` |
+| --- | --- | --- |
+| Role | Append-only telemetry log | Deduplicated knowledge commons |
+| Written | Once per evaluated `/calibrate` attempt (any verdict, duplicates included, upstream failures with a `NULL` verdict) | Upserted, one row per `(domain, tool_name, task_fingerprint, violation_rule)` |
+| Holds | `agent_pubkey`, candidate arguments, exact evaluated input, verdict, the full receipt, hashed client IP | Merged, paired lessons with the verified receipt |
+| Mutability | `UPDATE` and `DELETE` are rejected by triggers (migration `0006`) | Append-only `DELETE` trigger, populated columns locked |
+| Public | Never served | Served, except orphaned blocks |
+
+The split keeps thousands of identical agent failures in the telemetry log instead of flooding the public API: only the first BLOCK for an invariant becomes a canonical row, and later identical BLOCKs do not touch it (`ON CONFLICT ... DO NOTHING`, so they cannot overwrite an ALLOW receipt). Telemetry and the merge both run inline via `waitUntil`, so they add no latency to the response, and a failed merge never loses the telemetry record. Telemetry stores the submitted arguments verbatim, so treat the D1 database as sensitive.
+
+### `GET /api/v1/exemplars/bounties` (private)
+
+Lists incomplete exemplars so internal worker agents can resolve them asynchronously. It requires `Authorization: Bearer <FORGE_ADMIN_TOKEN>` and returns `401` for a missing, malformed or wrong token, and for every request while `FORGE_ADMIN_TOKEN` is unset (it fails closed). It is never cached (`Cache-Control: no-store`). The admin token is separate from `FORGE_WRITE_TOKEN`. This endpoint is deliberately not public: an orphaned block holds raw failure parameters, which would otherwise be a ready-made dictionary of inputs that probe the policy boundary.
+
+An exemplar is a bounty when it is one of:
+
+- **`orphaned_block`**: `failed_arguments` are recorded but `compliant_arguments` are empty and there is no ALLOW receipt yet. Resolve it by running the missing turn against the policy engine (`POST /api/v1/calibrate` with the row's `agent_pubkey` as `X-Agent-Pubkey`, the same `domain`, `tool` and `task_description`, and repaired arguments). An ALLOW completes the pair in place.
+- **`orphaned_allow`**: a compliant blueprint whose `steering_directive` is still empty or the generic `Compliant operational blueprint`, because no BLOCK was ever paired with it. These are also what manual `POST /api/v1/exemplars` submissions look like when they omit a directive.
+
+Query parameters, all optional: `kind` (`orphaned_block` or `orphaned_allow`; both when omitted), `domain`, `tool_name`, `limit` (1–50, default 10) and `offset` (0–10000, default 0). Newest first.
+
+```bash
+curl -sS "https://forge.ramenai.dev/api/v1/exemplars/bounties?kind=orphaned_block&limit=10" \
+  -H "Authorization: Bearer $FORGE_ADMIN_TOKEN"
+```
+
+```json
+{
+  "success": true,
+  "count": 1,
+  "limit": 10,
+  "offset": 0,
+  "bounties": [
+    {
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "kind": "orphaned_block",
+      "missing": ["compliant_arguments", "allow_receipt"],
+      "domain": "industrial_iot",
+      "tool_name": "dispatch_manipulation",
+      "task_description": "Move the identified crucible",
+      "task_fingerprint": "<sha256 of task_description>",
+      "failed_arguments": { "force_sensor": "degraded" },
+      "compliant_arguments": {},
+      "violation_rule": "force-sensor-health",
+      "steering_directive": "Restore the force sensor.",
+      "primary_statutory_anchor": "ISO 10218-1:2025",
+      "receipt_id": "<BLOCK receipt id>",
+      "agent_pubkey": "<64 hex chars, or null>",
+      "created_at": "2026-10-06T00:00:00.000Z"
+    }
+  ]
+}
+```
+
+An `orphaned_allow` bounty has `missing: ["steering_directive"]` and populated `compliant_arguments`. Current limitation: only orphaned blocks are completed in place by the pairing flow. A worker that reproduces a BLOCK and then an ALLOW for the same task produces a new paired row (the BLOCK's `violation_rule` differs from the allow's placeholder rule, so it is a different invariant) but does not rewrite the orphaned allow, which keeps appearing here. Healing those in place needs a dedicated write path, which this release does not add.
 
 **Related precedent on BLOCK.** When `allowed` is `false`, `steering_directive` is never left blank: it falls back from upstream recovery instructions, to the violation reasoning, to a generic retry instruction, in that order, so there is always something actionable to work from. The response also carries `related_exemplars`: up to 3 existing compliant blueprints already stored for the same `(domain, tool)`, newest first, in the same shape `GET /api/v1/exemplars` returns (`[]` if none exist yet, and always `[]` on an ALLOW verdict). This spares the agent a second round trip to `GET /api/v1/exemplars` just to find a parameter shape to retry with.
 
@@ -199,7 +271,7 @@ MOM console ("Agents forget. MOM remembers."): live stats, keyword search and do
 
 ## Authentication and trust
 
-Receipt submissions to `POST /api/v1/exemplars` are public and require no client token, API key, or `Authorization` header; the complete Schema V5 receipt is the sole admission credential. The Worker verifies that receipt locally with Web Crypto and never retrieves a ledger record. Read endpoints, `/api/v1/calibrate`, `/skill.md`, and the console are public. `/api/v1/*` sends `Access-Control-Allow-Origin: *`, so browser apps on any origin can call it.
+Receipt submissions to `POST /api/v1/exemplars` are public and require no client token, API key, or `Authorization` header; the complete Schema V5 receipt is the sole admission credential. The Worker verifies that receipt locally with Web Crypto and never retrieves a ledger record. Read endpoints, `/api/v1/calibrate`, `/skill.md`, and the console are public. The one exception is `GET /api/v1/exemplars/bounties`, which requires `Authorization: Bearer <FORGE_ADMIN_TOKEN>`. `X-Agent-Pubkey` is an unverified identity label and never grants access to anything. `/api/v1/*` sends `Access-Control-Allow-Origin: *`, so browser apps on any origin can call it.
 
 `/api/v1/calibrate` spends the forge's Enterprise ramen-ai quota on behalf of anonymous callers. The per-IP limit bounds a single client; the global hourly ceiling bounds total spend (at most 500 evaluations per hour), not who gets to use it.
 
@@ -218,7 +290,7 @@ npx wrangler d1 create ramen-forge-db
 # Apply migrations locally
 npx wrangler d1 migrations apply DB --local
 
-# Local secrets for upstream calibration only
+# Local secrets: upstream calibration (RAMEN_API_KEY) and the private bounty endpoint (FORGE_ADMIN_TOKEN)
 cp .dev.vars.example .dev.vars
 
 npm run dev
@@ -231,6 +303,7 @@ Deploy:
 ```bash
 npx wrangler d1 migrations apply DB --remote
 npx wrangler secret put RAMEN_API_KEY
+npx wrangler secret put FORGE_ADMIN_TOKEN   # required for GET /api/v1/exemplars/bounties; use a long random value
 npm run deploy
 ```
 

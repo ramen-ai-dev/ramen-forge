@@ -21,15 +21,18 @@ import {
   secondsUntilNextHour,
   type CalibrateOutcome,
 } from "./calibrate";
+import { sha256Hex } from "@ramen-ai/node-core";
 import { renderConsole } from "./console";
 import { INVALID_RECEIPT_CODE, INVALID_RECEIPT_MESSAGE, verifyExemplarReceipt } from "./receipt";
 import { SKILL_MD } from "./skill";
+import { findPriorBlock, recordCalibrationAttempt } from "./telemetry";
 import type { CalibrateRequest, CorrectionExemplarInput, CorrectionExemplarRecord, Env, ExemplarRow } from "./types";
 import {
   MAX_BODY_BYTES,
   MAX_CALIBRATE_BODY_BYTES,
   QUERY_PATTERNS,
   checkSearchTerm,
+  normalizeAgentPubkey,
   parseStoredObject,
   toLikePattern,
   validateCalibrateRequest,
@@ -63,10 +66,16 @@ const COMMUNITY_TIER = "community";
  *
  * A duplicate exemplar_id still raises UNIQUE on the primary key (409).
  */
-const UPSERT_SQL =
+const INSERT_EXEMPLAR_SQL =
   "INSERT INTO exemplars (id, domain, task_fingerprint, task_description, tool_name, violation_rule, " +
   "primary_statutory_anchor, steering_directive, failed_arguments_json, repaired_arguments_json, " +
-  "receipt_id, tier, created_at, signature, canonical_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+  "receipt_id, tier, created_at, signature, canonical_payload, agent_pubkey) " +
+  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ";
+
+const UPSERT_SQL =
+  INSERT_EXEMPLAR_SQL +
+  // agent_pubkey is deliberately absent from DO UPDATE SET: it records the agent that
+  // first contributed the lesson and never changes afterwards.
   "ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule) DO UPDATE SET " +
   "receipt_id = excluded.receipt_id, " +
   "signature = excluded.signature, " +
@@ -100,9 +109,35 @@ const UPSERT_SQL =
   "THEN excluded.primary_statutory_anchor ELSE exemplars.primary_statutory_anchor END " +
   "RETURNING id";
 
-type AppContext = Context<{ Bindings: Env }>;
+/**
+ * Turn 1 (BLOCK) insert. Deliberately DO NOTHING on conflict instead of UPSERT_SQL's
+ * receipt refresh: if the invariant already exists (for example a pair that was
+ * completed with its ALLOW receipt), a later BLOCK must not overwrite that receipt.
+ */
+const ORPHANED_BLOCK_SQL =
+  INSERT_EXEMPLAR_SQL + "ON CONFLICT (domain, tool_name, task_fingerprint, violation_rule) DO NOTHING";
 
-const app = new Hono<{ Bindings: Env }>();
+/**
+ * Orphan definitions, shared by the bounty query and the public-read filter.
+ *
+ * Orphaned block: a BLOCK was recorded (failed_arguments present) but no compliant
+ * parameters have been attached yet. These rows hold raw failure parameters, which
+ * act as an adversarial dictionary, so every public read excludes them.
+ *
+ * Orphaned allow: a compliant blueprint whose steering directive is still the generic
+ * placeholder or empty, because no BLOCK context was ever paired with it.
+ */
+const ORPHANED_BLOCK_WHERE = "(repaired_arguments_json = '{}' AND failed_arguments_json != '{}')";
+const ORPHANED_ALLOW_WHERE =
+  "(repaired_arguments_json != '{}' AND (steering_directive = 'Compliant operational blueprint' OR steering_directive = ''))";
+const PUBLIC_ROWS_WHERE = `NOT ${ORPHANED_BLOCK_WHERE}`;
+
+const GENERIC_ALLOW_STEERING = "Compliant operational blueprint";
+
+type AppVariables = { agentPubkey: string | null };
+type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
+
+const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
 // Public API: any origin may read. Writes still require a bearer token, which
 // browsers never attach automatically, so a wildcard origin adds no CSRF risk.
@@ -111,20 +146,50 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization", "Accept"],
+    allowHeaders: ["Content-Type", "Authorization", "Accept", "X-Agent-Pubkey"],
     exposeHeaders: ["RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset", "Retry-After"],
     maxAge: 86400,
   }),
 );
+
+/**
+ * Optional agent identity. X-Agent-Pubkey carries an Ed25519 public key (32 bytes as hex,
+ * base64 or base64url) and is normalised to lowercase hex. It is an UNVERIFIED label:
+ * no proof of key possession is checked, so it is used for telemetry and for pairing a
+ * Turn 2 ALLOW with that agent's Turn 1 BLOCK, never for authorization. Absent is fine;
+ * present-but-malformed is rejected so a client bug cannot silently produce unpaired lessons.
+ */
+app.use("/api/v1/*", async (c, next) => {
+  const raw = c.req.header("x-agent-pubkey");
+  if (raw === undefined || raw.trim() === "") {
+    c.set("agentPubkey", null);
+    return next();
+  }
+  const agentPubkey = normalizeAgentPubkey(raw);
+  if (!agentPubkey) {
+    return c.json(
+      { success: false, error: "X-Agent-Pubkey must be a 32-byte Ed25519 public key encoded as 64 hex characters or base64/base64url" },
+      400,
+    );
+  }
+  c.set("agentPubkey", agentPubkey);
+  return next();
+});
 
 interface VerifiedReceiptFields {
   signature: string;
   canonicalPayload: string;
 }
 
-function bindExemplar(db: D1Database, exemplar: CorrectionExemplarInput, receipt: VerifiedReceiptFields): D1PreparedStatement {
+function bindExemplar(
+  db: D1Database,
+  exemplar: CorrectionExemplarInput,
+  receipt: VerifiedReceiptFields,
+  agentPubkey: string | null = null,
+  sql: string = UPSERT_SQL,
+): D1PreparedStatement {
   return db
-    .prepare(UPSERT_SQL)
+    .prepare(sql)
     .bind(
       exemplar.exemplar_id,
       exemplar.domain,
@@ -141,6 +206,7 @@ function bindExemplar(db: D1Database, exemplar: CorrectionExemplarInput, receipt
       exemplar.created_at,
       receipt.signature,
       receipt.canonicalPayload,
+      agentPubkey,
     );
 }
 
@@ -150,39 +216,78 @@ function bindExemplar(db: D1Database, exemplar: CorrectionExemplarInput, receipt
  * is not auto-ingested. Shared by the response flag and the background job so
  * `auto_ingested` in the response always matches whether the write is attempted.
  */
-function isAutoIngestEligible(request: CalibrateRequest, outcome: Extract<CalibrateOutcome, { ok: true }>["body"]): boolean {
+function isAutoIngestEligible(request: CalibrateRequest, outcome: CalibrationBody): boolean {
   return outcome.allowed && outcome.receipt !== null && outcome.receipt_verified && Object.keys(request.arguments).length > 0;
 }
 
+/** A verified BLOCK with candidate arguments is kept as an orphaned block (private, see ORPHANED_BLOCK_WHERE). */
+function isBlockIngestEligible(request: CalibrateRequest, outcome: CalibrationBody): boolean {
+  return !outcome.allowed && outcome.receipt !== null && outcome.receipt_verified && Object.keys(request.arguments).length > 0;
+}
+
+type CalibrationBody = Extract<CalibrateOutcome, { ok: true }>["body"];
+
+// Control characters other than tab, newline and carriage return, same set validation.ts rejects.
+const CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
+/** Strip control characters and clamp length so upstream text always clears validateExemplar. */
+function cleanText(value: string, maxLength: number): string {
+  return value.replace(CONTROL_CHARS_RE, " ").trim().slice(0, maxLength);
+}
+
 /**
- * Automatically commit a verified ALLOW calibration result to the community
- * commons, so an autonomous agent that resolves a novel case through
- * POST /api/v1/calibrate never has to make a separate manual call to
- * POST /api/v1/exemplars to share it.
- *
- * Routed through the same `validateExemplar` the manual endpoint uses (control
- * character / size limits, credential-shape scanning, required-field checks)
- * and the same immutability-locked UPSERT_SQL (via bindExemplar): calibrate's
- * `arguments` is attacker-controlled input flowing straight into public memory
- * with no human or agent review step in between, so it must clear exactly the
- * same bar a manual submission would, and a second verified receipt for the
- * same invariant still cannot overwrite an already-populated row.
- *
- * Never throws: a failure here must not turn a successful calibration into an
- * error response, so every failure path logs and returns.
+ * Task label shared by Turn 1 and Turn 2. The caller's task_description when given,
+ * otherwise the same tool-derived default on both turns, so the fingerprint
+ * (SHA-256 of this text) is stable across a BLOCK and the ALLOW that follows it.
  */
-async function autoIngestCompliantBlueprint(
+function calibrationTaskDescription(request: CalibrateRequest): string {
+  return request.task_description?.trim() || `Compliant operational blueprint for ${request.tool}`;
+}
+
+/** Violation rule stored for a BLOCK: the evaluated rule names, else a policy-derived default. */
+function blockViolationRule(outcome: CalibrationBody): string {
+  const names = outcome.violations
+    .map((violation) => cleanText(violation.rule_name || violation.rule_id || "", 200))
+    .filter((name) => name !== "");
+  if (names.length > 0) return cleanText([...new Set(names)].join(" | "), 1000);
+  return `Statutory invariant violation (Policy ${outcome.policy_ids[0] ?? "unknown"})`;
+}
+
+/**
+ * Turn 2 (ALLOW): commit a verified compliant blueprint to the community commons, so an
+ * agent that resolves a novel case through POST /api/v1/calibrate never has to make a
+ * separate manual call to POST /api/v1/exemplars.
+ *
+ * If this agent's earlier BLOCK for the same task exists in the telemetry log, matched on
+ * (agent_pubkey, domain, tool_name, task_fingerprint), the two halves are merged into one
+ * row: the BLOCK supplies failed_arguments, violation_rule and steering_directive, the
+ * ALLOW supplies repaired_arguments and its own verified receipt. Reusing the BLOCK's
+ * violation_rule makes the upsert land on the orphaned-block row Turn 1 created, so the
+ * pair completes in place (same id, no second row, no new index needed).
+ *
+ * Routed through the same `validateExemplar` and immutability-locked UPSERT_SQL the manual
+ * endpoint uses: calibrate's `arguments` is attacker-controlled input flowing into public
+ * memory with no review step, so it must clear the same bar, and a populated column can
+ * never be overwritten by a later submission.
+ *
+ * Never throws: a failure here must not turn a successful calibration into an error.
+ */
+async function ingestAllowedCalibration(
   db: D1Database,
   request: CalibrateRequest,
-  outcome: Extract<CalibrateOutcome, { ok: true }>["body"],
+  outcome: CalibrationBody,
+  agentPubkey: string | null,
+  taskDescription: string,
+  taskFingerprint: string,
 ): Promise<void> {
   const receipt = outcome.receipt;
   if (!isAutoIngestEligible(request, outcome) || !receipt) return;
 
   try {
-    const taskDescription = request.task_description?.trim() || `Compliant operational blueprint for ${request.tool}`;
+    const prior = await findPriorBlock(db, agentPubkey, request.domain, request.tool, taskFingerprint);
     const policyId = outcome.policy_ids[0] ?? "general";
-    const primaryStatutoryAnchor = outcome.statutory_anchors[0] || `Statutory Invariant (Policy ${policyId})`;
+    const primaryStatutoryAnchor =
+      outcome.statutory_anchors[0] || prior?.primary_statutory_anchor || `Statutory Invariant (Policy ${policyId})`;
 
     // Lowercased once up front so exemplar_id, receipt_id, and the verifiedReceiptId
     // argument all agree, same as receipt.ts's own receiptId normalisation.
@@ -193,10 +298,10 @@ async function autoIngestCompliantBlueprint(
         domain: request.domain,
         task_description: taskDescription,
         tool_name: request.tool,
-        failed_arguments: {},
-        violation_reason: "No violation: compliant reference action",
+        failed_arguments: prior ? parseStoredObject(prior.arguments_json) : {},
+        violation_reason: prior?.violation_rule ?? "No violation: compliant reference action",
         primary_statutory_anchor: primaryStatutoryAnchor,
-        steering_directive: outcome.steering_directive || "Compliant operational blueprint",
+        steering_directive: prior?.steering_directive || outcome.steering_directive || GENERIC_ALLOW_STEERING,
         compliant_arguments: request.arguments,
         receipt_id: receiptId,
         created_at: new Date().toISOString(),
@@ -208,13 +313,170 @@ async function autoIngestCompliantBlueprint(
       return;
     }
 
-    await bindExemplar(db, result.value, { signature: receipt.signature, canonicalPayload: receipt.canonical_payload }).run();
+    await bindExemplar(
+      db,
+      result.value,
+      { signature: receipt.signature, canonicalPayload: receipt.canonical_payload },
+      agentPubkey,
+    ).run();
     console.log(
-      `ramen-forge auto-ingested compliant blueprint ${result.value.exemplar_id} into community memory (${request.domain}/${request.tool})`,
+      `ramen-forge auto-ingested ${prior ? "paired" : "compliant"} blueprint ${result.value.exemplar_id} into community memory (${request.domain}/${request.tool})`,
     );
   } catch (error) {
     console.error("ramen-forge auto-ingestion failed", error);
   }
+}
+
+/**
+ * Turn 1 (BLOCK): record the failure pattern as an orphaned block: failed_arguments,
+ * violation_rule and steering_directive, with compliant_arguments left empty until an
+ * ALLOW completes the pair. Private by construction: public reads exclude these rows
+ * (PUBLIC_ROWS_WHERE) and only the admin-gated bounty endpoint serves them.
+ *
+ * Never throws.
+ */
+async function ingestOrphanedBlock(
+  db: D1Database,
+  request: CalibrateRequest,
+  outcome: CalibrationBody,
+  agentPubkey: string | null,
+  taskDescription: string,
+  violationRule: string,
+): Promise<void> {
+  const receipt = outcome.receipt;
+  if (!isBlockIngestEligible(request, outcome) || !receipt) return;
+
+  try {
+    const policyId = outcome.policy_ids[0] ?? "general";
+    const receiptId = receipt.id.toLowerCase();
+    const result = await validateExemplar(
+      {
+        exemplar_id: receiptId,
+        domain: request.domain,
+        task_description: taskDescription,
+        tool_name: request.tool,
+        failed_arguments: request.arguments,
+        violation_reason: violationRule,
+        primary_statutory_anchor: cleanText(outcome.statutory_anchors[0] || `Statutory Invariant (Policy ${policyId})`, 256),
+        steering_directive: cleanText(outcome.steering_directive ?? "", 2000) || "Statutory invariant violation",
+        compliant_arguments: {},
+        receipt_id: receiptId,
+        created_at: new Date().toISOString(),
+      },
+      receiptId,
+    );
+    if (!result.ok) {
+      console.error("ramen-forge orphaned-block ingestion skipped: exemplar failed validation", result.errors);
+      return;
+    }
+
+    await bindExemplar(
+      db,
+      result.value,
+      { signature: receipt.signature, canonicalPayload: receipt.canonical_payload },
+      agentPubkey,
+      ORPHANED_BLOCK_SQL,
+    ).run();
+  } catch (error) {
+    console.error("ramen-forge orphaned-block ingestion failed", error);
+  }
+}
+
+/**
+ * Inline (waitUntil) handling of one evaluated calibration: always append the raw attempt
+ * to the telemetry log, then merge it into the canonical exemplars table. The telemetry
+ * write is independent of the merge, so a merge failure never loses the attempt record.
+ * `outcome` is null when the upstream evaluation failed (verdict NULL in the log).
+ *
+ * Never throws.
+ */
+async function processCalibration(
+  db: D1Database,
+  request: CalibrateRequest,
+  outcome: CalibrationBody | null,
+  failure: string | null,
+  agentPubkey: string | null,
+  ip: string,
+): Promise<void> {
+  try {
+    const taskDescription = calibrationTaskDescription(request);
+    const taskFingerprint = await sha256Hex(taskDescription);
+    const violationRule = outcome && !outcome.allowed ? blockViolationRule(outcome) : null;
+
+    try {
+      await recordCalibrationAttempt(db, {
+        agentPubkey,
+        domain: request.domain,
+        toolName: request.tool,
+        taskFingerprint,
+        taskDescription,
+        argumentsJson: JSON.stringify(request.arguments),
+        evaluatedInput: outcome?.evaluated_input ?? null,
+        verdict: outcome ? (outcome.allowed ? 1 : 0) : null,
+        violationRule,
+        steeringDirective: outcome ? outcome.steering_directive : null,
+        primaryStatutoryAnchor: outcome ? (outcome.statutory_anchors[0] ?? null) : null,
+        receiptId: outcome?.receipt_id ?? null,
+        receiptJson: outcome?.receipt ? JSON.stringify(outcome.receipt) : null,
+        receiptVerified: outcome?.receipt_verified ?? false,
+        error: failure,
+        clientIpHash: await hashClientIp("telemetry", ip),
+      });
+    } catch (error) {
+      console.error("ramen-forge calibration telemetry write failed", error);
+    }
+
+    if (!outcome) return;
+    if (outcome.allowed) {
+      await ingestAllowedCalibration(db, request, outcome, agentPubkey, taskDescription, taskFingerprint);
+    } else if (violationRule) {
+      await ingestOrphanedBlock(db, request, outcome, agentPubkey, taskDescription, violationRule);
+    }
+  } catch (error) {
+    console.error("ramen-forge calibration processing failed", error);
+  }
+}
+
+/** Schedule work after the response via waitUntil; await it inline when there is no ExecutionContext (unit tests). */
+async function runInBackground(c: AppContext, task: Promise<void>): Promise<void> {
+  // c.executionCtx throws (not just returns undefined) when the Worker was invoked
+  // without a FetchEvent/ExecutionContext, e.g. in unit tests calling app.request() directly.
+  try {
+    const executionContext = c.executionCtx;
+    if (typeof executionContext.waitUntil === "function") {
+      executionContext.waitUntil(task);
+      return;
+    }
+  } catch {
+    // fall through to the inline await
+  }
+  await task;
+}
+
+/** Constant-time string comparison: compares SHA-256 digests so length does not leak either. */
+async function constantTimeEqual(a: string, b: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [left, right] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(a)),
+    crypto.subtle.digest("SHA-256", encoder.encode(b)),
+  ]);
+  const x = new Uint8Array(left);
+  const y = new Uint8Array(right);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= (x[i] as number) ^ (y[i] as number);
+  return diff === 0;
+}
+
+/** Bearer check against FORGE_ADMIN_TOKEN. An unset token fails closed: nothing is authorized. */
+async function isAdminAuthorized(c: AppContext): Promise<boolean> {
+  const expected = c.env.FORGE_ADMIN_TOKEN;
+  if (!expected) {
+    console.error("ramen-forge bounties unavailable: FORGE_ADMIN_TOKEN is not configured");
+    return false;
+  }
+  const match = /^Bearer\s+(\S+)$/i.exec((c.req.header("authorization") ?? "").trim());
+  if (!match?.[1]) return false;
+  return constantTimeEqual(match[1], expected);
 }
 
 /**
@@ -243,9 +505,8 @@ const MAX_RELATED_EXEMPLARS = 3;
  * On a BLOCK verdict, look up existing compliant blueprints for the same
  * (domain, tool_name) so the agent can adjust its candidate arguments using
  * concrete precedent instead of guessing — without making a second,
- * separate GET /api/v1/exemplars call itself. These rows are always
- * verdict=1 blueprints (COMPLIANT_BLUEPRINTS_ONLY keeps verdict=0 out of
- * storage entirely), so there is nothing to filter out.
+ * separate GET /api/v1/exemplars call itself. Orphaned blocks (raw failure
+ * parameters with no compliant counterpart yet) are private and excluded.
  *
  * Read-only and best-effort: a lookup failure must not turn a successful
  * calibration into an error response, so failures are logged and an empty
@@ -259,7 +520,7 @@ async function fetchRelatedExemplars(
 ): Promise<CorrectionExemplarRecord[]> {
   try {
     const { results } = await db
-      .prepare("SELECT * FROM exemplars WHERE domain = ? AND tool_name = ? ORDER BY created_at DESC LIMIT ?")
+      .prepare(`SELECT * FROM exemplars WHERE domain = ? AND tool_name = ? AND ${PUBLIC_ROWS_WHERE} ORDER BY created_at DESC LIMIT ?`)
       .bind(domain, toolName, limit)
       .all<ExemplarRow>();
     return results.map(toRecord);
@@ -298,7 +559,8 @@ function toRecord(row: ExemplarRow): CorrectionExemplarRecord {
 
 /** Row as stored, with the two JSON-text columns replaced by parsed objects. */
 function toLookupRecord(row: ExemplarRow): Record<string, unknown> {
-  const { failed_arguments_json: failedJson, repaired_arguments_json: repairedJson, ...rest } = row;
+  // agent_pubkey is private telemetry and is never served on public reads.
+  const { failed_arguments_json: failedJson, repaired_arguments_json: repairedJson, agent_pubkey: _agentPubkey, ...rest } = row;
   const compliantArguments = parseStoredObject(repairedJson);
   return {
     ...rest,
@@ -516,7 +778,8 @@ app.get("/api/v1/exemplars", async (c) => {
   } = c.req.query();
   let demandQuery: string | null = null;
   const errors: string[] = [];
-  const where: string[] = [];
+  // Orphaned blocks hold raw failure parameters and are served only by the admin-gated bounty endpoint.
+  const where: string[] = [PUBLIC_ROWS_WHERE];
   const params: (string | number)[] = [];
 
   if (domain !== undefined) {
@@ -570,10 +833,7 @@ app.get("/api/v1/exemplars", async (c) => {
     return c.json({ success: false, error: "invalid query", details: errors }, 400);
   }
 
-  const sql =
-    "SELECT * FROM exemplars" +
-    (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
-    " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?";
+  const sql = `SELECT * FROM exemplars WHERE ${where.join(" AND ")} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`;
   let results: ExemplarRow[];
   try {
     const response = await c.env.DB.prepare(sql)
@@ -610,6 +870,95 @@ app.get("/api/v1/exemplars", async (c) => {
   return c.json({ success: true, count: exemplars.length, limit, offset, exemplars });
 });
 
+type BountyKind = "orphaned_block" | "orphaned_allow";
+const BOUNTY_KINDS: readonly BountyKind[] = ["orphaned_block", "orphaned_allow"];
+
+/** Shape of one bounty: an incomplete exemplar plus what is missing from it. */
+function toBountyRecord(row: ExemplarRow): Record<string, unknown> {
+  const isOrphanedBlock = row.repaired_arguments_json === "{}" && row.failed_arguments_json !== "{}";
+  const kind: BountyKind = isOrphanedBlock ? "orphaned_block" : "orphaned_allow";
+  return {
+    id: row.id,
+    kind,
+    missing: isOrphanedBlock ? ["compliant_arguments", "allow_receipt"] : ["steering_directive"],
+    domain: row.domain,
+    tool_name: row.tool_name,
+    task_description: row.task_description,
+    task_fingerprint: row.task_fingerprint,
+    failed_arguments: parseStoredObject(row.failed_arguments_json),
+    compliant_arguments: parseStoredObject(row.repaired_arguments_json),
+    violation_rule: row.violation_rule,
+    steering_directive: row.steering_directive,
+    primary_statutory_anchor: row.primary_statutory_anchor,
+    receipt_id: row.receipt_id,
+    agent_pubkey: row.agent_pubkey ?? null,
+    created_at: row.created_at,
+  };
+}
+
+/**
+ * Private: incomplete exemplars for internal worker agents to resolve. Requires
+ * Authorization: Bearer <FORGE_ADMIN_TOKEN>. Orphaned blocks carry raw failure
+ * parameters (an adversarial dictionary), so this is never public and is never cached.
+ */
+app.get("/api/v1/exemplars/bounties", async (c) => {
+  c.header("Cache-Control", "no-store");
+  if (!(await isAdminAuthorized(c))) {
+    c.header("WWW-Authenticate", 'Bearer realm="ramen-forge-bounties"');
+    return c.json({ success: false, error: "unauthorized" }, 401);
+  }
+
+  const { domain, tool_name: toolName, kind, limit: rawLimit, offset: rawOffset } = c.req.query();
+  const errors: string[] = [];
+  const where: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (kind === undefined) {
+    where.push(`(${ORPHANED_BLOCK_WHERE} OR ${ORPHANED_ALLOW_WHERE})`);
+  } else if (kind === "orphaned_block") {
+    where.push(ORPHANED_BLOCK_WHERE);
+  } else if (kind === "orphaned_allow") {
+    where.push(ORPHANED_ALLOW_WHERE);
+  } else {
+    errors.push(`kind must be one of: ${BOUNTY_KINDS.join(", ")}`);
+  }
+  if (domain !== undefined) {
+    if (!QUERY_PATTERNS.DOMAIN_RE.test(domain)) errors.push("domain is not a valid slug");
+    where.push("domain = ?");
+    params.push(domain);
+  }
+  if (toolName !== undefined) {
+    if (!QUERY_PATTERNS.TOOL_NAME_RE.test(toolName)) errors.push("tool_name is not valid");
+    where.push("tool_name = ?");
+    params.push(toolName);
+  }
+  let limit = DEFAULT_LIMIT;
+  if (rawLimit !== undefined) {
+    limit = Number(rawLimit);
+    if (!/^\d+$/.test(rawLimit) || limit < 1 || limit > MAX_LIMIT) {
+      errors.push(`limit must be an integer between 1 and ${MAX_LIMIT}`);
+    }
+  }
+  let offset = 0;
+  if (rawOffset !== undefined) {
+    offset = Number(rawOffset);
+    if (!/^\d+$/.test(rawOffset) || offset > MAX_OFFSET) {
+      errors.push(`offset must be an integer between 0 and ${MAX_OFFSET}`);
+    }
+  }
+  if (errors.length > 0) {
+    return c.json({ success: false, error: "invalid query", details: errors }, 400);
+  }
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM exemplars WHERE ${where.join(" AND ")} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`,
+  )
+    .bind(...params, limit, offset)
+    .all<ExemplarRow>();
+  const bounties = results.map(toBountyRecord);
+  return c.json({ success: true, count: bounties.length, limit, offset, bounties });
+});
+
 const MAX_FEEDBACK_BODY_BYTES = 1024;
 
 app.get("/api/v1/exemplars/:id", async (c) => {
@@ -618,7 +967,9 @@ app.get("/api/v1/exemplars/:id", async (c) => {
     // A non-UUID can never match a stored id; answer as not found rather than hit D1.
     return c.json({ success: false, error: "Exemplar not found" }, 404);
   }
-  const row = await c.env.DB.prepare("SELECT * FROM exemplars WHERE id = ?1").bind(id).first<ExemplarRow>();
+  const row = await c.env.DB.prepare(`SELECT * FROM exemplars WHERE id = ?1 AND ${PUBLIC_ROWS_WHERE}`)
+    .bind(id)
+    .first<ExemplarRow>();
   if (!row) return c.json({ success: false, error: "Exemplar not found" }, 404);
   return c.json({ success: true, exemplar: toLookupRecord(row) });
 });
@@ -652,7 +1003,7 @@ app.post("/api/v1/exemplars/:id/feedback", async (c) => {
 app.get("/api/v1/domains", async (c) => {
   const { results } = await c.env.DB.prepare(
     "SELECT domain, COUNT(*) AS lesson_count, GROUP_CONCAT(DISTINCT tool_name) AS tools_csv " +
-      "FROM exemplars GROUP BY domain ORDER BY domain",
+      `FROM exemplars WHERE ${PUBLIC_ROWS_WHERE} GROUP BY domain ORDER BY domain`,
   ).all<{ domain: string; lesson_count: number; tools_csv: string | null }>();
   const domains = results.map((r) => ({
     domain: r.domain,
@@ -666,10 +1017,10 @@ app.get("/api/v1/stats", async (c) => {
   const [totals, domains] = await c.env.DB.batch<Record<string, unknown>>([
     c.env.DB.prepare(
       "SELECT COUNT(*) AS total, COUNT(DISTINCT domain) AS domains, " +
-        "COUNT(DISTINCT primary_statutory_anchor) AS anchor_count FROM exemplars WHERE tier = ?",
+        `COUNT(DISTINCT primary_statutory_anchor) AS anchor_count FROM exemplars WHERE tier = ? AND ${PUBLIC_ROWS_WHERE}`,
     ).bind(COMMUNITY_TIER),
     c.env.DB.prepare(
-      "SELECT domain, COUNT(*) AS exemplars FROM exemplars WHERE tier = ? GROUP BY domain ORDER BY exemplars DESC, domain",
+      `SELECT domain, COUNT(*) AS exemplars FROM exemplars WHERE tier = ? AND ${PUBLIC_ROWS_WHERE} GROUP BY domain ORDER BY exemplars DESC, domain`,
     ).bind(COMMUNITY_TIER),
   ]);
   const row = totals?.results[0] ?? {};
@@ -747,34 +1098,24 @@ app.post("/api/v1/calibrate", async (c) => {
   // Atomic reservation closes the race between the pre-check and the upstream call.
   if (!(await reserveGlobalSlot(c.env.DB))) return communityCapacityReached(c);
 
+  const agentPubkey = c.get("agentPubkey");
   const outcome = await evaluateCalibration(apiKey, request.value, bundleId, evaluateUrl);
   if (!outcome.ok) {
+    // Upstream failures are still telemetry (verdict NULL), so adoption counts stay complete.
+    await runInBackground(c, processCalibration(c.env.DB, request.value, null, outcome.error, agentPubkey, ip));
     return c.json(
       { success: false, error: outcome.error, ...(outcome.upstream_status ? { upstream_status: outcome.upstream_status } : {}) },
       outcome.status,
     );
   }
 
-  // An ALLOW verdict with a verified receipt is committed to the community commons
-  // automatically, so the agent never has to make a separate POST /api/v1/exemplars
-  // call to share the compliant blueprint it just resolved.
+  // Every evaluated attempt is appended to the calibration_attempts telemetry log, then
+  // merged into the canonical exemplars table: a verified ALLOW is committed to the
+  // commons (completing this agent's earlier BLOCK into one paired row when there is
+  // one), and a verified BLOCK is kept as a private orphaned block. `auto_ingested`
+  // reports only the public commons write, so it stays false for a BLOCK.
   const willAutoIngest = isAutoIngestEligible(request.value, outcome.body);
-  if (willAutoIngest) {
-    const ingest = autoIngestCompliantBlueprint(c.env.DB, request.value, outcome.body);
-    // c.executionCtx throws (not just returns undefined) when the Worker was invoked
-    // without a FetchEvent/ExecutionContext, e.g. in unit tests calling app.request()
-    // directly. Same defensive pattern as logDemand's scheduling above.
-    try {
-      const executionContext = c.executionCtx;
-      if (typeof executionContext.waitUntil === "function") {
-        executionContext.waitUntil(ingest);
-      } else {
-        await ingest;
-      }
-    } catch {
-      await ingest;
-    }
-  }
+  await runInBackground(c, processCalibration(c.env.DB, request.value, outcome.body, null, agentPubkey, ip));
 
   // On BLOCK, hand the agent concrete compliant precedent for this exact (domain, tool_name)
   // inline in the same response, rather than requiring it to make a second

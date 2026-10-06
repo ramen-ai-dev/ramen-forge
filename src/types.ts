@@ -3,6 +3,8 @@ export interface Env {
   DB: D1Database;
   /** Bearer token required by write endpoints. Unset means writes are disabled. */
   FORGE_WRITE_TOKEN?: string;
+  /** Bearer token for the private GET /api/v1/exemplars/bounties endpoint. Unset means the endpoint rejects every request. */
+  FORGE_ADMIN_TOKEN?: string;
   /** Enterprise ramen-ai API key used by the community calibration proxy. */
   RAMEN_API_KEY?: string;
   /** Base URL of the ramen-ai gateway for /calibrate and authoritative receipt ledger pulls (default https://api.ramenai.dev). */
@@ -84,4 +86,6 @@ export interface ExemplarRow {
   canonical_payload: string | null;
   times_applied: number;
   successful_applications: number;
+  /** Unverified X-Agent-Pubkey label of the agent that first contributed the lesson. Never served publicly. */
+  agent_pubkey: string | null;
 }

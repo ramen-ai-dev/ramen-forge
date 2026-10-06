@@ -297,6 +297,31 @@ export function toLikePattern(term: string): string {
   return `%${term.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
+const AGENT_PUBKEY_HEX_RE = /^[0-9a-fA-F]{64}$/;
+const AGENT_PUBKEY_BASE64_RE = /^(?:[A-Za-z0-9_-]{43}|[A-Za-z0-9+/]{43}=?)$/;
+
+/**
+ * Normalise an X-Agent-Pubkey header value to a canonical 64-character lowercase
+ * hex string, so one key sent as hex, base64 or base64url always maps to the same
+ * label. Returns null if the value is not a 32-byte key in one of those encodings.
+ *
+ * The result is an unverified label: no proof of key possession is requested, so
+ * it is used for telemetry and Turn 1 / Turn 2 pairing, never for authorization.
+ */
+export function normalizeAgentPubkey(raw: string): string | null {
+  const value = raw.trim();
+  if (AGENT_PUBKEY_HEX_RE.test(value)) return value.toLowerCase();
+  if (!AGENT_PUBKEY_BASE64_RE.test(value)) return null;
+  try {
+    const standard = value.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+    const binary = atob(`${standard}=`);
+    if (binary.length !== 32) return null;
+    return Array.from(binary, (char) => char.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}
+
 export const MAX_CALIBRATE_BODY_BYTES = MAX_ARGUMENTS_BYTES + 1024;
 const CALIBRATE_KEYS = new Set(["domain", "tool", "arguments", "task_description"]);
 const MAX_CALIBRATE_TASK_DESCRIPTION = 2000;
