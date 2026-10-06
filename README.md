@@ -205,7 +205,7 @@ A global ceiling of 500 upstream evaluations per UTC hour, across all clients, p
 { "success": false, "error": { "code": "COMMUNITY_CAPACITY_REACHED", "message": "Global community calibration capacity reached for this hour (500/500). ..." } }
 ``` Upstream failures return `502` / `504` without relaying the upstream body. Returns `503` if `RAMEN_API_KEY` is not set or `RAMEN_GATEWAY_URL` is not a plain `https` origin.
 
-The upstream is `${RAMEN_GATEWAY_URL}/api/v1/paas/evaluate` (default `https://api.ramenai.dev`). `wrangler.toml` sets it to the gateway Worker's `workers.dev` hostname, because on `forge.ramenai.dev` subrequests to `api.ramenai.dev` (same zone) fail with `522`.
+The upstream is `${RAMEN_GATEWAY_URL}/api/v1/paas/evaluate` (default `https://api.ramenai.dev`). The hosted deployment overrides it in its (unpublished) `wrangler.toml`, because on `forge.ramenai.dev` subrequests to `api.ramenai.dev` (same zone) fail with `522`.
 
 ### `GET /skill.md`
 
@@ -234,7 +234,10 @@ Requires Node.js and a Cloudflare account.
 ```bash
 npm install
 
-# Create the database, then paste the printed database_id into wrangler.toml
+# Create your deploy config (gitignored), then paste your account_id and the printed database_id into it
+cp wrangler.toml.example wrangler.toml
+
+# Create the database
 npx wrangler d1 create ramen-forge-db
 
 # Apply migrations locally

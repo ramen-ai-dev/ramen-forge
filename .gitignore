@@ -8,3 +8,6 @@ dist/
 .env.*
 *.log
 .DS_Store
+
+# Deploy config holds account/database ids; copy wrangler.toml.example instead
+wrangler.toml

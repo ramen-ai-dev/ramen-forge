@@ -1,21 +1,22 @@
+# Copy to wrangler.toml (gitignored) and fill in your own values.
 name = "ramen-forge"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 # Top-level keys must come before any [table] header, or TOML nests them inside it.
-account_id = "bfbf0f57606c0dfd9fb36bef616d9158"
+# Pinning account_id keeps `wrangler deploy` on the right account when several are logged in.
+account_id = "<your-cloudflare-account-id>"
 
 [observability]
 enabled = true
 
 [vars]
-# /calibrate upstream. On forge.ramenai.dev, subrequests to api.ramenai.dev (same zone)
-# fail with 522, so route to the gateway Worker's workers.dev hostname instead.
-RAMEN_GATEWAY_URL = "https://ramen-gateway-worker.ramenai.workers.dev"
+# /calibrate upstream (a plain https origin). Defaults to https://api.ramenai.dev when unset.
+# RAMEN_GATEWAY_URL = "https://<your-gateway-origin>"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "ramen-forge-db"
-database_id = "c0cc03e9-69ee-4e03-9798-27747103658f"
+database_id = "<printed-by-wrangler-d1-create>"
 migrations_dir = "migrations"
 
 # Legacy full-payload writes require a bearer token; receipt-reference ledger pulls are public.
@@ -23,6 +24,7 @@ migrations_dir = "migrations"
 # Local dev:   put FORGE_WRITE_TOKEN=... in .dev.vars (gitignored)
 # Both calibration and public ledger pulls use the server-side RAMEN_API_KEY.
 
-[[routes]]
-pattern = "forge.ramenai.dev"
-custom_domain = true
+# Optional: serve from your own domain.
+# [[routes]]
+# pattern = "<your-forge-hostname>"
+# custom_domain = true
